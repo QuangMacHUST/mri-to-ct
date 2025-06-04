@@ -115,13 +115,13 @@ class MRIToCTDataset(Dataset):
         
         # Random flip horizontal
         if random.random() > 0.5:
-            mri_slice = np.fliplr(mri_slice)
-            ct_slice = np.fliplr(ct_slice)
+            mri_slice = np.fliplr(mri_slice).copy()
+            ct_slice = np.fliplr(ct_slice).copy()
             
         # Random flip vertical
         if random.random() > 0.5:
-            mri_slice = np.flipud(mri_slice)
-            ct_slice = np.flipud(ct_slice)
+            mri_slice = np.flipud(mri_slice).copy()
+            ct_slice = np.flipud(ct_slice).copy()
         
         # Random intensity scaling cho MRI (±10%)
         if random.random() > 0.5:
@@ -178,6 +178,10 @@ class MRIToCTDataset(Dataset):
         if mri_slice.shape != (256, 256):
             mri_slice = cv2.resize(mri_slice, (256, 256), interpolation=cv2.INTER_LINEAR)
             ct_slice = cv2.resize(ct_slice, (256, 256), interpolation=cv2.INTER_LINEAR)
+        
+        # Đảm bảo arrays có positive strides
+        mri_slice = mri_slice.copy()
+        ct_slice = ct_slice.copy()
         
         # Chuyển về tensor và thêm channel dimension
         mri_tensor = torch.tensor(mri_slice, dtype=torch.float32).unsqueeze(0)  # [1, H, W]

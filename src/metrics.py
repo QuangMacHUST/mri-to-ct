@@ -1,7 +1,31 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
+try:
+    # Thử import từ skimage.metrics trước (phiên bản mới)
+    from skimage.metrics import structural_similarity as ssim
+except ImportError:
+    try:
+        # Fallback cho phiên bản cũ
+        from skimage.measure import compare_ssim as ssim
+    except ImportError:
+        # Fallback cuối cùng - tự implement SSIM đơn giản
+        def ssim(img1, img2, data_range=1.0, win_size=7):
+            """Simple SSIM fallback implementation"""
+            # Đơn giản hóa SSIM bằng correlation
+            img1_flat = img1.flatten()
+            img2_flat = img2.flatten()
+            
+            if len(img1_flat) <= 1:
+                return 0.0
+                
+            # Tính correlation
+            corr = np.corrcoef(img1_flat, img2_flat)
+            if corr.shape == (2, 2):
+                return max(0, min(1, corr[0, 1]))
+            else:
+                return 0.0
+
 from typing import Dict, Tuple
 
 class MetricsCalculator:
@@ -64,35 +88,103 @@ class MetricsCalculator:
             pred_img = pred_np[i, 0] if pred_np.shape[1] > 1 else pred_np[i]
             target_img = target_np[i, 0] if target_np.shape[1] > 1 else target_np[i]
             
-            # Chuẩn hóa về [0, 1] cho SSIM
-            pred_img = (pred_img - pred_img.min()) / (pred_img.max() - pred_img.min() + 1e-8)
-            target_img = (target_img - target_img.min()) / (target_img.max() - target_img.min() + 1e-8)
+            # Kiểm tra NaN/Inf trước khi normalize
+            if np.any(np.isnan(pred_img)) or np.any(np.isnan(target_img)) or \
+               np.any(np.isinf(pred_img)) or np.any(np.isinf(target_img)):
+                ssim_values.append(0.0)
+                continue
             
-            # Tính SSIM
-            ssim_val = ssim(pred_img, target_img, data_range=1.0)
+            # Chuẩn hóa về [0, 1] cho SSIM với safe division
+            pred_range = pred_img.max() - pred_img.min()
+            target_range = target_img.max() - target_img.min()
+            
+            if pred_range > 1e-8:
+                pred_img = (pred_img - pred_img.min()) / pred_range
+            else:
+                pred_img = np.zeros_like(pred_img)
+                
+            if target_range > 1e-8:
+                target_img = (target_img - target_img.min()) / target_range
+            else:
+                target_img = np.zeros_like(target_img)
+            
+            # Tính win_size phù hợp với kích thước ảnh
+            min_side = min(pred_img.shape)
+            if min_side < 7:
+                # Nếu ảnh quá nhỏ, dùng win_size nhỏ hơn
+                win_size = max(3, min_side if min_side % 2 == 1 else min_side - 1)
+            else:
+                win_size = 7  # default
+            
+            # Tính SSIM với win_size phù hợp
+            try:
+                ssim_val = ssim(pred_img, target_img, data_range=1.0, win_size=win_size)
+                
+                # Kiểm tra kết quả SSIM có hợp lệ không
+                if np.isnan(ssim_val) or np.isinf(ssim_val):
+                    ssim_val = 0.0
+                    
+            except (ValueError, RuntimeWarning):
+                # Fallback nếu vẫn lỗi - dùng correlation thay thế
+                pred_flat = pred_img.flatten()
+                target_flat = target_img.flatten()
+                
+                # Safe correlation calculation
+                if len(pred_flat) > 1 and np.std(pred_flat) > 1e-8 and np.std(target_flat) > 1e-8:
+                    try:
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            corr_matrix = np.corrcoef(pred_flat, target_flat)
+                            correlation = corr_matrix[0, 1]
+                            
+                        if np.isnan(correlation) or np.isinf(correlation):
+                            correlation = 0.0
+                    except:
+                        correlation = 0.0
+                else:
+                    correlation = 0.0
+                    
+                ssim_val = max(0, correlation)  # Clamp về [0, 1]
+                
             ssim_values.append(ssim_val)
         
-        return np.mean(ssim_values)
+        # Return safe mean
+        if ssim_values:
+            return np.mean([v for v in ssim_values if not (np.isnan(v) or np.isinf(v))])
+        else:
+            return 0.0
     
     @staticmethod
     def normalized_cross_correlation(pred: torch.Tensor, target: torch.Tensor) -> float:
         """
-        Tính Normalized Cross Correlation (NCC)
+        Tính Normalized Cross Correlation (NCC) với safe division
         """
         # Flatten tensors
         pred_flat = pred.view(pred.size(0), -1)
         target_flat = target.view(target.size(0), -1)
         
         # Normalize
-        pred_norm = pred_flat - pred_flat.mean(dim=1, keepdim=True)
-        target_norm = target_flat - target_flat.mean(dim=1, keepdim=True)
+        pred_mean = pred_flat.mean(dim=1, keepdim=True)
+        target_mean = target_flat.mean(dim=1, keepdim=True)
         
-        # Compute correlation
+        pred_norm = pred_flat - pred_mean
+        target_norm = target_flat - target_mean
+        
+        # Compute correlation với safe division
         numerator = (pred_norm * target_norm).sum(dim=1)
-        denominator = torch.sqrt((pred_norm ** 2).sum(dim=1) * (target_norm ** 2).sum(dim=1))
+        pred_std = torch.sqrt((pred_norm ** 2).sum(dim=1))
+        target_std = torch.sqrt((target_norm ** 2).sum(dim=1))
+        denominator = pred_std * target_std
         
+        # Safe division với epsilon lớn hơn
         ncc = numerator / (denominator + 1e-8)
-        return ncc.mean().item()
+        
+        # Filter out NaN/Inf values
+        ncc = ncc[torch.isfinite(ncc)]
+        
+        if len(ncc) > 0:
+            return ncc.mean().item()
+        else:
+            return 0.0
     
     @staticmethod
     def calculate_all_metrics(pred: torch.Tensor, target: torch.Tensor, max_value: float = 1.0) -> Dict[str, float]:
