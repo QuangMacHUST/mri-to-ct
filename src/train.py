@@ -461,7 +461,7 @@ def main():
         # Data parameters
         'mri_dir': '../data/MRI',
         'ct_dir': '../data/CT',
-        'batch_size': 1,          # Giảm xuống 1 để tiết kiệm VRAM
+        'batch_size': 2,          # Giảm xuống 1 để tiết kiệm VRAM
         'num_workers': 0,         # Giảm về 0 để tránh Windows multiprocessing issues
         'train_split': 0.8,
         
