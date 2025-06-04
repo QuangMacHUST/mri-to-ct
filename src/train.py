@@ -152,8 +152,7 @@ class CycleGANTrainer:
             'G_cycle': 0.0,
             'G_identity': 0.0,
             'G_perceptual': 0.0,
-            'D_CT': 0.0,
-            'D_MRI': 0.0
+            'D_total': 0.0
         }
         
         progress_bar = tqdm(train_loader, desc=f"Training Epoch {self.current_epoch}")
@@ -194,8 +193,8 @@ class CycleGANTrainer:
                 real_mri, outputs['fake_mri'], self.model.D_MRI
             )
             
-            # Total discriminator loss
-            loss_D_total = loss_D_CT + loss_D_MRI
+            # Total discriminator loss - AVERAGE instead of SUM
+            loss_D_total = (loss_D_CT + loss_D_MRI) * 0.5
             loss_D_total.backward()
             self.optimizer_D.step()
             
@@ -207,8 +206,7 @@ class CycleGANTrainer:
             epoch_losses['G_cycle'] += g_losses['cycle'].item()
             epoch_losses['G_identity'] += g_losses['identity'].item()
             epoch_losses['G_perceptual'] += g_losses['perceptual'].item()
-            epoch_losses['D_CT'] += loss_D_CT.item()
-            epoch_losses['D_MRI'] += loss_D_MRI.item()
+            epoch_losses['D_total'] += loss_D_total.item()  # Store averaged D_loss
             
             # Update metrics
             self.train_metrics.update(outputs['fake_ct'], real_ct)
@@ -461,7 +459,7 @@ def main():
         # Data parameters
         'mri_dir': '../data/MRI',
         'ct_dir': '../data/CT',
-        'batch_size': 2,          # Giảm xuống 1 để tiết kiệm VRAM
+        'batch_size': 1,          # Giảm xuống 1 để tiết kiệm VRAM
         'num_workers': 0,         # Giảm về 0 để tránh Windows multiprocessing issues
         'train_split': 0.8,
         

@@ -55,14 +55,14 @@ class MetricsCalculator:
         return torch.sqrt(F.mse_loss(pred, target)).item()
     
     @staticmethod
-    def peak_signal_to_noise_ratio(pred: torch.Tensor, target: torch.Tensor, max_value: float = 1.0) -> float:
+    def peak_signal_to_noise_ratio(pred: torch.Tensor, target: torch.Tensor, max_value: float = 2.0) -> float:
         """
-        Tính Peak Signal-to-Noise Ratio (PSNR)
+        Tính Peak Signal-to-Noise Ratio (PSNR) cho CycleGAN data (range [-1,1])
         
         Args:
-            pred: ảnh dự đoán
-            target: ảnh ground truth
-            max_value: giá trị pixel maximum (mặc định 1.0 cho ảnh normalized)
+            pred: ảnh dự đoán trong range [-1,1]
+            target: ảnh ground truth trong range [-1,1]
+            max_value: giá trị pixel maximum range (2.0 cho data [-1,1])
         """
         mse = F.mse_loss(pred, target)
         if mse == 0:
@@ -74,122 +74,158 @@ class MetricsCalculator:
     @staticmethod
     def structural_similarity_index(pred: torch.Tensor, target: torch.Tensor) -> float:
         """
-        Tính Structural Similarity Index (SSIM)
+        Tính Structural Similarity Index (SSIM) cho CycleGAN data (range [-1,1])
         """
         # Chuyển tensor về numpy và xử lý batch
         pred_np = pred.detach().cpu().numpy()
         target_np = target.detach().cpu().numpy()
         
+        # Convert từ [-1,1] về [0,1] để phù hợp với SSIM algorithm
+        pred_np = (pred_np + 1.0) / 2.0
+        target_np = (target_np + 1.0) / 2.0
+        
+        # Clamp để đảm bảo trong [0,1]
+        pred_np = np.clip(pred_np, 0, 1)
+        target_np = np.clip(target_np, 0, 1)
+        
         ssim_values = []
         
         # Tính SSIM cho từng sample trong batch
         for i in range(pred_np.shape[0]):
-            # Lấy channel đầu tiên nếu có nhiều channel
-            pred_img = pred_np[i, 0] if pred_np.shape[1] > 1 else pred_np[i]
-            target_img = target_np[i, 0] if target_np.shape[1] > 1 else target_np[i]
+            pred_img = pred_np[i, 0]  # [H, W]
+            target_img = target_np[i, 0]  # [H, W]
             
-            # Kiểm tra NaN/Inf trước khi normalize
-            if np.any(np.isnan(pred_img)) or np.any(np.isnan(target_img)) or \
-               np.any(np.isinf(pred_img)) or np.any(np.isinf(target_img)):
-                ssim_values.append(0.0)
-                continue
-            
-            # Chuẩn hóa về [0, 1] cho SSIM với safe division
-            pred_range = pred_img.max() - pred_img.min()
-            target_range = target_img.max() - target_img.min()
-            
-            if pred_range > 1e-8:
-                pred_img = (pred_img - pred_img.min()) / pred_range
-            else:
-                pred_img = np.zeros_like(pred_img)
-                
-            if target_range > 1e-8:
-                target_img = (target_img - target_img.min()) / target_range
-            else:
-                target_img = np.zeros_like(target_img)
-            
-            # Tính win_size phù hợp với kích thước ảnh
+            # Kiểm tra kích thước tối thiểu
             min_side = min(pred_img.shape)
             if min_side < 7:
-                # Nếu ảnh quá nhỏ, dùng win_size nhỏ hơn
-                win_size = max(3, min_side if min_side % 2 == 1 else min_side - 1)
-            else:
-                win_size = 7  # default
-            
-            # Tính SSIM với win_size phù hợp
-            try:
-                ssim_val = ssim(pred_img, target_img, data_range=1.0, win_size=win_size)
-                
-                # Kiểm tra kết quả SSIM có hợp lệ không
-                if np.isnan(ssim_val) or np.isinf(ssim_val):
-                    ssim_val = 0.0
-                    
-            except (ValueError, RuntimeWarning):
-                # Fallback nếu vẫn lỗi - dùng correlation thay thế
+                # Nếu ảnh quá nhỏ, dùng correlation thay thế
                 pred_flat = pred_img.flatten()
                 target_flat = target_img.flatten()
                 
-                # Safe correlation calculation
-                if len(pred_flat) > 1 and np.std(pred_flat) > 1e-8 and np.std(target_flat) > 1e-8:
+                # Kiểm tra variance để tránh division by zero
+                pred_var = np.var(pred_flat)
+                target_var = np.var(target_flat)
+                
+                if pred_var > 1e-10 and target_var > 1e-10:
                     try:
-                        with np.errstate(divide='ignore', invalid='ignore'):
-                            corr_matrix = np.corrcoef(pred_flat, target_flat)
-                            correlation = corr_matrix[0, 1]
-                            
+                        # Manually compute correlation để tránh np.corrcoef warning
+                        pred_centered = pred_flat - np.mean(pred_flat)
+                        target_centered = target_flat - np.mean(target_flat)
+                        
+                        correlation = np.sum(pred_centered * target_centered) / (
+                            np.sqrt(np.sum(pred_centered**2)) * np.sqrt(np.sum(target_centered**2))
+                        )
+                        
                         if np.isnan(correlation) or np.isinf(correlation):
                             correlation = 0.0
+                        
+                        ssim_val = max(0, min(1, abs(correlation)))
                     except:
-                        correlation = 0.0
+                        ssim_val = 0.0
                 else:
-                    correlation = 0.0
+                    ssim_val = 0.0
+                
+                ssim_values.append(ssim_val)
+                continue
+            
+            # Tính win_size phù hợp
+            win_size = min(7, min_side if min_side % 2 == 1 else min_side - 1)
+            
+            # Tính SSIM với data_range=1.0 (vì đã convert về [0,1])
+            try:
+                ssim_val = ssim(pred_img, target_img, data_range=1.0, win_size=win_size)
+                
+                # Kiểm tra kết quả hợp lệ
+                if np.isnan(ssim_val) or np.isinf(ssim_val):
+                    ssim_val = 0.0
                     
-                ssim_val = max(0, correlation)  # Clamp về [0, 1]
+            except Exception:
+                # Fallback sử dụng correlation manual
+                pred_flat = pred_img.flatten()
+                target_flat = target_img.flatten()
+                
+                # Kiểm tra variance để tránh division by zero
+                pred_var = np.var(pred_flat)
+                target_var = np.var(target_flat)
+                
+                if pred_var > 1e-10 and target_var > 1e-10:
+                    try:
+                        # Manually compute correlation để tránh np.corrcoef warning
+                        pred_centered = pred_flat - np.mean(pred_flat)
+                        target_centered = target_flat - np.mean(target_flat)
+                        
+                        correlation = np.sum(pred_centered * target_centered) / (
+                            np.sqrt(np.sum(pred_centered**2)) * np.sqrt(np.sum(target_centered**2))
+                        )
+                        
+                        if np.isnan(correlation) or np.isinf(correlation):
+                            correlation = 0.0
+                        
+                        ssim_val = max(0, min(1, abs(correlation)))
+                    except:
+                        ssim_val = 0.0
+                else:
+                    ssim_val = 0.0
                 
             ssim_values.append(ssim_val)
         
         # Return safe mean
         if ssim_values:
-            return np.mean([v for v in ssim_values if not (np.isnan(v) or np.isinf(v))])
+            valid_values = [v for v in ssim_values if not (np.isnan(v) or np.isinf(v))]
+            return np.mean(valid_values) if valid_values else 0.0
         else:
             return 0.0
     
     @staticmethod
     def normalized_cross_correlation(pred: torch.Tensor, target: torch.Tensor) -> float:
         """
-        Tính Normalized Cross Correlation (NCC) với safe division
+        Tính Normalized Cross Correlation (NCC) với robust handling
         """
         # Flatten tensors
         pred_flat = pred.view(pred.size(0), -1)
         target_flat = target.view(target.size(0), -1)
         
-        # Normalize
-        pred_mean = pred_flat.mean(dim=1, keepdim=True)
-        target_mean = target_flat.mean(dim=1, keepdim=True)
+        ncc_values = []
         
-        pred_norm = pred_flat - pred_mean
-        target_norm = target_flat - target_mean
+        for i in range(pred.size(0)):
+            pred_sample = pred_flat[i]
+            target_sample = target_flat[i]
+            
+            # Compute means
+            pred_mean = pred_sample.mean()
+            target_mean = target_sample.mean()
+            
+            # Center the data
+            pred_centered = pred_sample - pred_mean
+            target_centered = target_sample - target_mean
+            
+            # Compute standard deviations
+            pred_std = torch.sqrt(torch.mean(pred_centered**2))
+            target_std = torch.sqrt(torch.mean(target_centered**2))
+            
+            # Check for zero variance to avoid division by zero
+            if pred_std > 1e-8 and target_std > 1e-8:
+                # Compute correlation
+                correlation = torch.mean(pred_centered * target_centered) / (pred_std * target_std)
+                
+                # Check for valid result
+                if torch.isfinite(correlation):
+                    ncc_values.append(correlation.item())
+                else:
+                    ncc_values.append(0.0)
+            else:
+                ncc_values.append(0.0)
         
-        # Compute correlation với safe division
-        numerator = (pred_norm * target_norm).sum(dim=1)
-        pred_std = torch.sqrt((pred_norm ** 2).sum(dim=1))
-        target_std = torch.sqrt((target_norm ** 2).sum(dim=1))
-        denominator = pred_std * target_std
-        
-        # Safe division với epsilon lớn hơn
-        ncc = numerator / (denominator + 1e-8)
-        
-        # Filter out NaN/Inf values
-        ncc = ncc[torch.isfinite(ncc)]
-        
-        if len(ncc) > 0:
-            return ncc.mean().item()
+        # Return mean of valid values
+        if ncc_values:
+            return np.mean(ncc_values)
         else:
             return 0.0
     
     @staticmethod
-    def calculate_all_metrics(pred: torch.Tensor, target: torch.Tensor, max_value: float = 1.0) -> Dict[str, float]:
+    def calculate_all_metrics(pred: torch.Tensor, target: torch.Tensor, max_value: float = 2.0) -> Dict[str, float]:
         """
-        Tính tất cả metrics cùng lúc
+        Tính tất cả metrics cùng lúc cho CycleGAN data (range [-1,1])
         """
         metrics = {}
         
@@ -219,9 +255,9 @@ class MetricsTracker:
         }
         self.calculator = MetricsCalculator()
     
-    def update(self, pred: torch.Tensor, target: torch.Tensor, max_value: float = 1.0):
+    def update(self, pred: torch.Tensor, target: torch.Tensor, max_value: float = 2.0):
         """
-        Cập nhật metrics cho batch hiện tại
+        Cập nhật metrics cho batch hiện tại với CycleGAN data (range [-1,1])
         """
         metrics = self.calculator.calculate_all_metrics(pred, target, max_value)
         
