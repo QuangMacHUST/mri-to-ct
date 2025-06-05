@@ -456,17 +456,17 @@ def main():
     """
     # Cấu hình training tối ưu cho GTX 1650 (4GB VRAM)
     config = {
-        # Data parameters
+        # Data parameters  
         'mri_dir': '../data/MRI',
         'ct_dir': '../data/CT',
-        'batch_size': 1,          # Giảm xuống 1 để tiết kiệm VRAM
+        'batch_size': 2,          # Giảm xuống 1 để tiết kiệm VRAM
         'num_workers': 0,         # Giảm về 0 để tránh Windows multiprocessing issues
         'train_split': 0.8,
         
         # Model parameters - Tối ưu cho 4GB VRAM
         'input_nc': 1,
         'output_nc': 1,
-        'n_residual_blocks': 6,   # Giảm từ 9 xuống 6 để tiết kiệm memory
+        'n_residual_blocks': 9,   # Giảm từ 9 xuống 6 để tiết kiệm memory
         'discriminator_layers': 3,
         
         # Training parameters
@@ -484,8 +484,8 @@ def main():
         'sample_dir': 'samples',
         
         # Save frequencies
-        'save_freq': 5,           # Save thường xuyên hơn
-        'sample_freq': 2          # Sample thường xuyên hơn
+        'save_freq': 1,           # Save thường xuyên hơn
+        'sample_freq': 1          # Sample thường xuyên hơn
     }
     
     # Tạo thư mục cần thiết

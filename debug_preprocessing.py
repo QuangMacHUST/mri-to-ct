@@ -63,44 +63,71 @@ class MRIToCTDataset(Dataset):
         binary_mask = ndimage.binary_fill_holes(binary_mask)
         return binary_mask.astype(np.float32)
     
-    def _normalize_intensity(self, image_array: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        masked_values = image_array[mask > 0]
-        if len(masked_values) > 0:
-            min_val = np.min(masked_values)
-            max_val = np.max(masked_values)
-            if max_val > min_val:
-                normalized = np.zeros_like(image_array)
-                normalized[mask > 0] = (image_array[mask > 0] - min_val) / (max_val - min_val)
-                image_array = normalized
-            else:
-                image_array = np.zeros_like(image_array)
-        return image_array
-    
-    def _remove_head_frame(self, image_array: np.ndarray, modality: str = 'CT'):
+    def _remove_head_frame_gentle(self, image_array: np.ndarray, modality: str = 'CT'):
         cleaned_array = image_array.copy()
         
         if modality == 'CT':
             normalized = (image_array - image_array.min()) / (image_array.max() - image_array.min())
-            high_intensity_threshold = np.percentile(normalized, 98)  # Stricter
-            metal_mask = normalized > high_intensity_threshold
-            metal_mask = morphology.remove_small_objects(metal_mask, min_size=1000)  # Larger
-            kernel = morphology.ball(1)  # Smaller kernel
-            metal_mask = morphology.binary_dilation(metal_mask, kernel)
-            background_value = np.median(image_array[normalized < 0.3])
-            cleaned_array[metal_mask] = background_value
+            metal_threshold = np.percentile(normalized, 99)  # Top 1% only
+            metal_mask = normalized > metal_threshold
+            metal_mask = morphology.remove_small_objects(metal_mask, min_size=2000)
+            
+            if np.any(metal_mask):
+                kernel = morphology.ball(1)
+                metal_mask = morphology.binary_dilation(metal_mask, kernel)
+                air_value = np.percentile(image_array, 5)
+                cleaned_array[metal_mask] = air_value
         else:  # MRI
             normalized = (image_array - image_array.min()) / (image_array.max() - image_array.min())
-            high_threshold = np.percentile(normalized, 98)  # Top 2%
-            low_threshold = np.percentile(normalized, 2)    # Bottom 2%
+            high_threshold = np.percentile(normalized, 99.5)  # Top 0.5%
+            low_threshold = np.percentile(normalized, 0.5)    # Bottom 0.5%
             artifact_mask = (normalized > high_threshold) | (normalized < low_threshold)
-            artifact_mask = morphology.remove_small_objects(artifact_mask, min_size=500)
-            kernel = morphology.ball(1)
-            artifact_mask = morphology.binary_dilation(artifact_mask, kernel)
-            background_value = np.median(image_array[normalized < 0.5])
-            cleaned_array[artifact_mask] = background_value
+            artifact_mask = morphology.remove_small_objects(artifact_mask, min_size=1000)
+            
+            if np.any(artifact_mask):
+                kernel = morphology.ball(1)
+                artifact_mask = morphology.binary_dilation(artifact_mask, kernel)
+                brain_value = np.median(image_array[(normalized > 0.2) & (normalized < 0.8)])
+                cleaned_array[artifact_mask] = brain_value
+            
             metal_mask = artifact_mask
         
         return cleaned_array, metal_mask.astype(np.float32)
+    
+    def _tissue_aware_normalization(self, image_array: np.ndarray, mask: np.ndarray, modality: str = 'CT'):
+        masked_values = image_array[mask > 0]
+        if len(masked_values) == 0:
+            return image_array
+        
+        if modality == 'CT':
+            # Preserve CT tissue contrast
+            min_val = np.percentile(masked_values, 2)
+            max_val = np.percentile(masked_values, 98)
+            
+            # Ensure reasonable dynamic range
+            if max_val - min_val < (image_array.max() - image_array.min()) * 0.1:
+                min_val = np.percentile(masked_values, 5)
+                max_val = np.percentile(masked_values, 95)
+        else:
+            # MRI: Percentile-based để có full range [-1,1]
+            min_val = np.percentile(masked_values, 1)   # Loại bỏ extreme dark outliers
+            max_val = np.percentile(masked_values, 99)  # Loại bỏ extreme bright outliers
+            
+            # Đảm bảo có dynamic range hợp lý
+            if max_val - min_val < (image_array.max() - image_array.min()) * 0.2:
+                min_val = np.min(masked_values)
+                max_val = np.max(masked_values)
+        
+        if max_val > min_val:
+            normalized = np.zeros_like(image_array)
+            normalized[mask > 0] = (image_array[mask > 0] - min_val) / (max_val - min_val)
+            if modality == 'MRI':
+                normalized = np.clip(normalized, 0, 1.0)  # Full range cho MRI
+            else:
+                normalized = np.clip(normalized, 0, 1.2)  # Headroom cho CT
+            return normalized
+        else:
+            return np.zeros_like(image_array)
     
     def _crop_brain_roi(self, image_array: np.ndarray, mask: np.ndarray):
         brain_coords = np.where(mask > 0)
@@ -138,18 +165,18 @@ class MRIToCTDataset(Dataset):
         mri_array = sitk.GetArrayFromImage(mri_sitk).astype(np.float32)
         ct_array = sitk.GetArrayFromImage(ct_sitk).astype(np.float32)
         
-        # BƯỚC 2: Remove head frame TRƯỚC mask
-        print(f"Đang loại bỏ head frame cho {self.mri_files[idx]}...")
-        mri_array, mri_frame_mask = self._remove_head_frame(mri_array, 'MRI')
-        ct_array, ct_frame_mask = self._remove_head_frame(ct_array, 'CT')
+        # BƯỚC 2: Gentle head frame removal
+        print(f"Gentle head frame removal cho {self.mri_files[idx]}...")
+        mri_array, mri_frame_mask = self._remove_head_frame_gentle(mri_array, 'MRI')
+        ct_array, ct_frame_mask = self._remove_head_frame_gentle(ct_array, 'CT')
         
         # BƯỚC 3: Tạo mask sau khi clean
         mri_mask = self._create_otsu_mask(mri_array)
         ct_mask = self._create_otsu_mask(ct_array)
         
-        # BƯỚC 4: Normalize
-        mri_array = self._normalize_intensity(mri_array, mri_mask)
-        ct_array = self._normalize_intensity(ct_array, ct_mask)
+        # BƯỚC 4: Tissue-aware normalization
+        mri_array = self._tissue_aware_normalization(mri_array, mri_mask, 'MRI')
+        ct_array = self._tissue_aware_normalization(ct_array, ct_mask, 'CT')
         
         # BƯỚC 5: Crop brain ROI  
         mri_array, mri_mask = self._crop_brain_roi(mri_array, mri_mask)
