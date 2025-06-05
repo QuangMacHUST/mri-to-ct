@@ -61,6 +61,95 @@ class MRIToCTTester:
         
         print(f"Model loaded successfully từ epoch {checkpoint.get('epoch', 'unknown')}")
         print_model_summary(self.model)
+    
+    def _create_brain_with_skull_mask(self, mri_array: np.ndarray) -> np.ndarray:
+        """
+        Tạo comprehensive mask bao gồm brain tissue + skull để preserve bone structures
+        """
+        from skimage import filters, morphology, measure
+        from scipy import ndimage
+        
+        # Step 1: Normalize về [0, 1]
+        normalized = (mri_array - mri_array.min()) / (mri_array.max() - mri_array.min())
+        
+        # Step 2: Multi-threshold approach để capture brain + skull
+        otsu_thresh = filters.threshold_otsu(normalized)
+        
+        # Lower threshold để capture brain tissue (including gray matter)
+        brain_thresh = otsu_thresh * 0.6  # Slightly lower để capture more
+        
+        # Higher threshold để capture bright structures (skull in some MRI sequences)
+        skull_thresh = otsu_thresh * 1.2
+        
+        # Combine brain and potential skull regions
+        brain_mask = normalized > brain_thresh
+        bright_mask = normalized > skull_thresh
+        
+        # Step 3: Create comprehensive mask
+        # Start với brain mask
+        comprehensive_mask = brain_mask.copy()
+        
+        # Step 4: Morphological operations
+        # Remove small noise objects
+        comprehensive_mask = morphology.remove_small_objects(comprehensive_mask, min_size=1500)
+        
+        # Fill holes để có continuous region
+        comprehensive_mask = ndimage.binary_fill_holes(comprehensive_mask)
+        
+        # Step 5: Get largest connected component + surrounding region
+        labeled_mask = measure.label(comprehensive_mask)
+        if labeled_mask.max() > 0:
+            component_sizes = np.bincount(labeled_mask.ravel())
+            component_sizes[0] = 0  # Ignore background
+            largest_component = np.argmax(component_sizes)
+            main_region = (labeled_mask == largest_component)
+        else:
+            main_region = comprehensive_mask
+        
+        # Step 6: Expand mask để include skull region
+        # Dilation để capture skull structures around brain
+        kernel_expand = morphology.ball(3)  # Slightly larger kernel
+        expanded_mask = morphology.binary_dilation(main_region, kernel_expand)
+        
+        # Step 7: Refine với shape constraints
+        # Remove regions quá xa brain center
+        center_of_mass = ndimage.center_of_mass(main_region)
+        
+        # Create distance-based refinement
+        coords = np.ogrid[0:expanded_mask.shape[0], 0:expanded_mask.shape[1], 0:expanded_mask.shape[2]]
+        distances = np.sqrt(
+            (coords[0] - center_of_mass[0])**2 +
+            (coords[1] - center_of_mass[1])**2 +
+            (coords[2] - center_of_mass[2])**2
+        )
+        
+        # Maximum reasonable distance để include skull
+        max_brain_radius = np.max(distances[main_region]) * 1.3  # 30% buffer for skull
+        distance_mask = distances <= max_brain_radius
+        
+        # Combine expanded mask với distance constraint
+        final_mask = expanded_mask & distance_mask
+        
+        # Step 8: Final morphological cleanup
+        # Gentle closing để smooth contours
+        kernel_smooth = morphology.ball(2)
+        final_mask = morphology.binary_closing(final_mask, kernel_smooth)
+        
+        # Fill any remaining holes
+        final_mask = ndimage.binary_fill_holes(final_mask)
+        
+        # Ensure mask is not too large (safety check)
+        total_volume = np.prod(mri_array.shape)
+        mask_volume = np.sum(final_mask)
+        
+        if mask_volume > total_volume * 0.7:  # If mask > 70% of image, too large
+            print("Warning: Mask too large, falling back to conservative approach")
+            # Fall back to original brain mask
+            conservative_mask = main_region
+            kernel_conservative = morphology.ball(1)
+            final_mask = morphology.binary_dilation(conservative_mask, kernel_conservative)
+        
+        return final_mask.astype(np.float32)
         
     def test_single_image(self, mri_path: str, output_dir: str, save_comparison: bool = True) -> Dict[str, float]:
         """
@@ -83,21 +172,18 @@ class MRIToCTTester:
         mri_array = sitk.GetArrayFromImage(mri_sitk).astype(np.float32)
         
         # Áp dụng N4 bias correction
+        # Cast to float32 first để avoid pixel type error
+        mri_sitk = sitk.Cast(mri_sitk, sitk.sitkFloat32)
         corrector = sitk.N4BiasFieldCorrectionImageFilter()
         corrector.SetMaximumNumberOfIterations([50] * 4)
         mri_sitk_corrected = corrector.Execute(mri_sitk)
         mri_array = sitk.GetArrayFromImage(mri_sitk_corrected).astype(np.float32)
         
-        # Tạo binary mask và normalize
-        from skimage import filters, morphology
+        # Tạo comprehensive brain+skull mask để preserve bone structures
+        from skimage import filters, morphology, measure
         from scipy import ndimage
         
-        normalized = ((mri_array - mri_array.min()) / 
-                     (mri_array.max() - mri_array.min()) * 255).astype(np.uint8)
-        threshold = filters.threshold_otsu(normalized)
-        binary_mask = normalized > threshold
-        binary_mask = morphology.remove_small_objects(binary_mask, min_size=1000)
-        binary_mask = ndimage.binary_fill_holes(binary_mask).astype(np.float32)
+        binary_mask = self._create_brain_with_skull_mask(mri_array)
         
         # Normalize intensity với Min-Max normalization
         masked_values = mri_array[binary_mask > 0]
