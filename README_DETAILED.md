@@ -429,7 +429,7 @@ tensorboard --logdir logs/
 - Learning rates
 
 ### Sample Images
-- **Frequency**: Mỗi 5 epochs
+- **Frequency**: Mỗi 1 epochs
 - **Location**: `samples/epoch_X/`
 - **Content**: Real MRI, Fake CT, Real CT, Reconstructed images
 
@@ -452,25 +452,6 @@ tensorboard --logdir logs/
 - **Artifacts**: Tối thiểu noise và distortion
 - **Anatomical consistency**: Giữ nguyên cấu trúc từ MRI
 
-## ⚠️ Lưu ý Quan trọng
-
-### Medical Applications
-1. **Validation requirement**: Kết quả cần được xác thực bởi chuyên gia y tế
-2. **Clinical responsibility**: Không sử dụng trực tiếp mà không có supervision
-3. **Regulatory compliance**: Tuân thủ các quy định y tế địa phương
-4. **Quality assurance**: Kiểm tra kỹ lưỡng trước khi sử dụng lâm sàng
-
-### Technical Considerations
-1. **Data quality**: Chất lượng input ảnh hưởng trực tiếp đến output
-2. **Domain specificity**: Model được train cho brain images
-3. **Generalization**: Cần validation với different scanners/protocols
-4. **Computational cost**: Training resource-intensive
-
-### Hyperparameter Tuning
-- **Learning rates**: Có thể cần điều chỉnh tùy dataset
-- **Loss weights**: Fine-tune dựa trên validation metrics
-- **Architecture**: Có thể thay đổi số residual blocks
-- **Training schedule**: Điều chỉnh decay timing
 
 ## 📚 Tài liệu Tham khảo
 
@@ -487,33 +468,6 @@ tensorboard --logdir logs/
 - **README Best Practices**: [How to Write a Good README](https://www.freecodecamp.org/news/how-to-write-a-good-readme-file/)
 - **Documentation Standards**: [Make a README](https://www.makeareadme.com/)
 
-## 🤝 Contributing
-
-### Development Guidelines
-1. **Code style**: Follow PEP 8 conventions
-2. **Documentation**: Comment all functions và classes
-3. **Testing**: Add unit tests for new features
-4. **Version control**: Use descriptive commit messages
-
-### Bug Reports
-- Include system specifications
-- Provide error logs và stack traces
-- Describe reproduction steps
-- Attach sample data if possible
-
-## 📄 License
-
-[Thêm thông tin license phù hợp]
-
-## 👥 Liên hệ
-
-**Nhóm phát triển**: MRI-to-CT Research Team
-**Email**: [Thêm email liên hệ]
-**Institution**: [Thêm thông tin tổ chức]
-
----
-
-**Lưu ý**: Đây là dự án nghiên cứu. Kết quả cần được validation và approval từ chuyên gia y tế trước khi sử dụng trong thực tế lâm sàng. 
 
 ## 2. Data Preprocessing Pipeline
 

@@ -325,16 +325,16 @@ class MRIToCTDataset(Dataset):
     
     def _augment_data(self, mri_slice: np.ndarray, ct_slice: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Áp dụng data augmentation
+        Áp dụng data augmentation trên range [-1,1]
         """
         if not self.is_training:
             return mri_slice, ct_slice
             
-        # Random rotation (-10 đến 10 độ)
+        # Random rotation (-15 đến 15 độ)
         if random.random() > 0.5:
-            angle = random.uniform(-10, 10)
-            mri_slice = ndimage.rotate(mri_slice, angle, reshape=False, mode='constant', cval=0)
-            ct_slice = ndimage.rotate(ct_slice, angle, reshape=False, mode='constant', cval=0)
+            angle = random.uniform(-15, 15)
+            mri_slice = ndimage.rotate(mri_slice, angle, reshape=False, mode='constant', cval=-1)  # Background = -1
+            ct_slice = ndimage.rotate(ct_slice, angle, reshape=False, mode='constant', cval=-1)   # Background = -1
         
         # Random flip horizontal
         if random.random() > 0.5:
@@ -346,12 +346,12 @@ class MRIToCTDataset(Dataset):
             mri_slice = np.flipud(mri_slice).copy()
             ct_slice = np.flipud(ct_slice).copy()
         
-        # Random intensity scaling cho MRI (±10%) - chỉ trong vùng mask
+        # Random intensity scaling cho MRI (±10%) - chỉ trong vùng có data
         if random.random() > 0.5:
             scale_factor = random.uniform(0.9, 1.1)
-            mask = mri_slice > 0  # Detect brain region
+            mask = mri_slice > -0.8  # Detect brain region (trong range [-1,1])
             mri_slice[mask] = mri_slice[mask] * scale_factor
-            mri_slice = np.clip(mri_slice, 0, 1)  # Clip về [0,1]
+            mri_slice = np.clip(mri_slice, -1, 1)  # Clip về [-1,1]
             
         return mri_slice, ct_slice
     
@@ -450,12 +450,12 @@ class MRIToCTDataset(Dataset):
         mri_slice = np.clip(mri_slice, 0, 1)
         ct_slice = np.clip(ct_slice, 0, 1)
         
-        # BƯỚC 10: Data augmentation
-        mri_slice, ct_slice = self._augment_data(mri_slice, ct_slice)
-        
-        # BƯỚC 11: Convert về [-1,1] cho model
+        # BƯỚC 10: Convert về [-1,1] cho model
         mri_slice = mri_slice * 2.0 - 1.0
         ct_slice = ct_slice * 2.0 - 1.0
+        
+        # BƯỚC 11: Data augmentation (cuối cùng để thống nhất)
+        mri_slice, ct_slice = self._augment_data(mri_slice, ct_slice)
         
         # Đảm bảo arrays có positive strides
         mri_slice = mri_slice.copy()
