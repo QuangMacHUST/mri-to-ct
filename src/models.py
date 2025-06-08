@@ -304,9 +304,31 @@ class CycleGAN(nn.Module):
             'perceptual': loss_perceptual
         }
     
-    def discriminator_loss(self, real_images, fake_images, discriminator):
+    def discriminator_loss(self, real_mri, real_ct, outputs):
         """
-        Tính Discriminator loss (LSGAN loss cho ổn định)
+        Tính loss cho cả 2 discriminators (CT và MRI)
+        """
+        fake_ct = outputs['fake_ct']
+        fake_mri = outputs['fake_mri']
+        
+        # Discriminator CT loss
+        loss_D_CT = self._single_discriminator_loss(real_ct, fake_ct, self.D_CT)
+        
+        # Discriminator MRI loss  
+        loss_D_MRI = self._single_discriminator_loss(real_mri, fake_mri, self.D_MRI)
+        
+        # Total discriminator loss
+        total_loss = (loss_D_CT + loss_D_MRI) * 0.5
+        
+        return {
+            'total': total_loss,
+            'D_CT': loss_D_CT,
+            'D_MRI': loss_D_MRI
+        }
+    
+    def _single_discriminator_loss(self, real_images, fake_images, discriminator):
+        """
+        Tính Discriminator loss cho một discriminator (LSGAN loss cho ổn định)
         """
         # Real images - target = 1
         pred_real = discriminator(real_images)

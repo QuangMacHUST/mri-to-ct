@@ -1,4 +1,5 @@
 import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import time
 import torch
 import torch.optim as optim
@@ -23,12 +24,14 @@ class CycleGANTrainer:
     def __init__(self, 
                  config: Dict,
                  device: str = 'cuda',
-                 resume_from_checkpoint: bool = True):
+                 resume_from_checkpoint: bool = True,
+                 checkpoint_path: str = None):
         """
         Args:
             config: dictionary chứa các tham số training
             device: thiết bị training (cuda/cpu)
             resume_from_checkpoint: có tải lại checkpoint không
+            checkpoint_path: đường dẫn cụ thể đến checkpoint (nếu có)
         """
         self.config = config
         self.device = torch.device(device)
@@ -79,14 +82,12 @@ class CycleGANTrainer:
             eta_min=config['lr_D'] * 0.01
         )
         
-        # Không cần metrics trackers nữa - tính trực tiếp trong mỗi epoch
-        
         # Tensorboard writer
         self.writer = SummaryWriter(log_dir=config['log_dir'])
         
-        # Thử load checkpoint nếu có
-        if self.resume_from_checkpoint:
-            self.load_checkpoint()
+        # Load checkpoint nếu được chỉ định
+        if self.resume_from_checkpoint and checkpoint_path:
+            self.load_checkpoint(checkpoint_path)
         
         print(f"Model khởi tạo thành công trên {device}")
         print(f"Tổng số parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -94,32 +95,16 @@ class CycleGANTrainer:
         if self.best_ssim > 0:
             print(f"Best SSIM hiện tại: {self.best_ssim:.4f}")
     
-    def load_checkpoint(self):
+    def load_checkpoint(self, checkpoint_path: str):
         """
-        Tải checkpoint gần nhất để tiếp tục training
+        Tải checkpoint từ đường dẫn cụ thể
+        Args:
+            checkpoint_path: đường dẫn đến file checkpoint
         """
-        checkpoint_dir = self.config['checkpoint_dir']
-        
-        # Tìm checkpoint gần nhất
-        latest_checkpoint = None
-        latest_epoch = -1
-        
-        if os.path.exists(checkpoint_dir):
-            for filename in os.listdir(checkpoint_dir):
-                if filename.startswith('checkpoint_epoch_') and filename.endswith('.pth'):
-                    try:
-                        epoch_num = int(filename.split('_')[2].split('.')[0])
-                        if epoch_num > latest_epoch:
-                            latest_epoch = epoch_num
-                            latest_checkpoint = os.path.join(checkpoint_dir, filename)
-                    except:
-                        continue
-        
-        # Tải checkpoint nếu tìm thấy
-        if latest_checkpoint and os.path.exists(latest_checkpoint):
+        if os.path.exists(checkpoint_path):
             try:
-                print(f"Đang tải checkpoint: {latest_checkpoint}")
-                checkpoint = torch.load(latest_checkpoint, map_location=self.device, weights_only=False)
+                print(f"Đang tải checkpoint: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
                 
                 # Load model state
                 self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -137,6 +122,7 @@ class CycleGANTrainer:
                 self.best_ssim = checkpoint.get('best_ssim', 0.0)
                 
                 print(f"✅ Đã tải checkpoint thành công từ epoch {checkpoint['epoch']}")
+                print(f"   Checkpoint được lưu tại epoch {checkpoint['epoch']}")
                 print(f"   Sẽ tiếp tục training từ epoch {self.current_epoch}")
                 
             except Exception as e:
@@ -145,7 +131,7 @@ class CycleGANTrainer:
                 self.current_epoch = 0
                 self.best_ssim = 0.0
         else:
-            print("Không tìm thấy checkpoint. Bắt đầu training từ đầu.")
+            print(f"❌ Không tìm thấy checkpoint: {checkpoint_path}")
     
     def get_current_lr(self):
         """Lấy learning rate hiện tại"""
@@ -169,8 +155,9 @@ class CycleGANTrainer:
         }
         
         num_batches = len(train_loader)
+        metrics_calculator = MetricsCalculator()
         
-        # Progress bar với thông tin learning rate
+        # Progress bar với thông tin learning rate và metrics đầy đủ
         current_lr = self.get_current_lr()
         pbar = tqdm(train_loader, 
                    desc=f"Training Epoch {self.current_epoch+1}: LR_G={current_lr['lr_G']:.6f}")
@@ -198,42 +185,44 @@ class CycleGANTrainer:
             # Gradient clipping cho Generator với adaptive norm
             grad_norm_g = torch.nn.utils.clip_grad_norm_(
                 list(self.model.G_MRI2CT.parameters()) + list(self.model.G_CT2MRI.parameters()),
-                max_norm=5.0  # Giảm từ 10.0 xuống 5.0
+                max_norm=5.0  
             )
             
             self.optimizer_G.step()
             
-            # =============== Train Discriminator ===============  
+            # =============== Train Discriminator ===============
             self.optimizer_D.zero_grad()
             
-            # Discriminator CT
-            fake_ct = outputs['fake_ct'].detach()  # Detach để không backward qua Generator
-            loss_D_CT = self.model.discriminator_loss(real_ct, fake_ct, self.model.D_CT)
+            # Compute discriminator losses
+            d_losses = self.model.discriminator_loss(real_mri, real_ct, outputs)
+            d_losses['total'].backward()
             
-            # Discriminator MRI  
-            fake_mri = outputs['fake_mri'].detach()
-            loss_D_MRI = self.model.discriminator_loss(real_mri, fake_mri, self.model.D_MRI)
-            
-            loss_D_total = (loss_D_CT + loss_D_MRI) * 0.5
-            loss_D_total.backward()
-            
-            # Gradient clipping cho Discriminators
+            # Gradient clipping cho Discriminator
             grad_norm_d = torch.nn.utils.clip_grad_norm_(
                 list(self.model.D_CT.parameters()) + list(self.model.D_MRI.parameters()),
-                max_norm=5.0  # Giảm từ 10.0 xuống 5.0
+                max_norm=5.0
             )
             
             self.optimizer_D.step()
             
+            # Update schedulers
+            self.scheduler_G.step()
+            self.scheduler_D.step()
+            
             # Accumulate losses
             total_g_loss += g_losses['total'].item()
-            total_d_loss += loss_D_total.item()
+            total_d_loss += d_losses['total'].item()
             
-            # Compute metrics cho fake_ct
+            # Tính metrics cho batch hiện tại
             with torch.no_grad():
-                metrics = MetricsCalculator.calculate_all_metrics(outputs['fake_ct'], real_ct)
-                # Key mapping từ metrics calculator sang total_metrics
-                metric_mapping = {
+                fake_ct = outputs['fake_ct']
+                batch_metrics = metrics_calculator.calculate_all_metrics(
+                    fake_ct,  # Truyền tensor trực tiếp
+                    real_ct   # Truyền tensor trực tiếp
+                )
+                
+                # Accumulate metrics với key mapping
+                metric_key_mapping = {
                     'mae': 'MAE',
                     'mse': 'MSE', 
                     'rmse': 'RMSE',
@@ -242,37 +231,26 @@ class CycleGANTrainer:
                     'ncc': 'NCC'
                 }
                 for key in total_metrics:
-                    if metric_mapping[key] in metrics:
-                        total_metrics[key] += metrics[metric_mapping[key]]
+                    if metric_key_mapping[key] in batch_metrics:
+                        total_metrics[key] += batch_metrics[metric_key_mapping[key]]
             
-            # Update progress bar với gradient norms
+            # Cập nhật progress bar với metrics đầy đủ
             pbar.set_postfix({
-                'G_loss': g_losses['total'].item(),
-                'D_loss': loss_D_total.item(),
-                'SSIM': metrics.get('SSIM', 0.0),
-                'Grad_G': f"{grad_norm_g:.2f}",
-                'Grad_D': f"{grad_norm_d:.2f}"
+                'G_loss': f"{g_losses['total'].item():.4f}",
+                'D_loss': f"{d_losses['total'].item():.4f}",
+                'SSIM': f"{batch_metrics['SSIM']:.4f}",
+                'MAE': f"{batch_metrics['MAE']:.4f}",
+                'PSNR': f"{batch_metrics['PSNR']:.2f}"
             })
-            
-            # Kiểm tra memory leak
-            if i % 50 == 0:
-                torch.cuda.empty_cache()
         
-        # Step learning rate schedulers
-        self.scheduler_G.step()
-        self.scheduler_D.step()
-        
-        # Average losses và metrics
+        # Average metrics over epoch
         avg_g_loss = total_g_loss / num_batches
         avg_d_loss = total_d_loss / num_batches
-        
-        avg_metrics = {}
-        for key in total_metrics:
-            avg_metrics[key] = total_metrics[key] / num_batches
+        avg_metrics = {key: value / num_batches for key, value in total_metrics.items()}
         
         return {
-            'g_loss': avg_g_loss,
-            'd_loss': avg_d_loss,
+            'generator_loss': avg_g_loss,
+            'discriminator_loss': avg_d_loss,
             **avg_metrics
         }
     
@@ -323,9 +301,14 @@ class CycleGANTrainer:
                 total_g_loss += g_losses['total'].item()
                 
                 # Compute metrics cho fake_ct
-                metrics = MetricsCalculator.calculate_all_metrics(outputs['fake_ct'], real_ct)
-                # Key mapping từ metrics calculator sang total_metrics
-                metric_mapping = {
+                metrics_calculator = MetricsCalculator()
+                batch_metrics = metrics_calculator.calculate_all_metrics(
+                    outputs['fake_ct'],  # Truyền tensor trực tiếp
+                    real_ct              # Truyền tensor trực tiếp
+                )
+                
+                # Accumulate metrics với key mapping
+                metric_key_mapping = {
                     'mae': 'MAE',
                     'mse': 'MSE', 
                     'rmse': 'RMSE',
@@ -334,8 +317,8 @@ class CycleGANTrainer:
                     'ncc': 'NCC'
                 }
                 for key in total_metrics:
-                    if metric_mapping[key] in metrics:
-                        total_metrics[key] += metrics[metric_mapping[key]]
+                    if metric_key_mapping[key] in batch_metrics:
+                        total_metrics[key] += batch_metrics[metric_key_mapping[key]]
         
         # Average losses và metrics
         avg_g_loss = total_g_loss / num_batches
@@ -358,8 +341,8 @@ class CycleGANTrainer:
         Ghi log vào tensorboard
         """
         # Training losses
-        self.writer.add_scalar('Loss/Train_G', train_losses['g_loss'], self.current_epoch)
-        self.writer.add_scalar('Loss/Train_D', train_losses['d_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss/Train_G', train_losses['generator_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss/Train_D', train_losses['discriminator_loss'], self.current_epoch)
         
         # Validation losses
         self.writer.add_scalar('Loss/Val_G', val_losses['g_loss'], self.current_epoch)
@@ -410,7 +393,6 @@ class CycleGANTrainer:
         start_time = time.time()
         
         for epoch in range(self.current_epoch, self.config['num_epochs']):
-            self.current_epoch = epoch
             epoch_start_time = time.time()
             
             # Training
@@ -426,7 +408,7 @@ class CycleGANTrainer:
             epoch_time = time.time() - epoch_start_time
             print(f"\nEpoch {epoch+1}/{self.config['num_epochs']} - Time: {epoch_time:.2f}s")
             print(f"LR_G: {current_lr['lr_G']:.6f} | LR_D: {current_lr['lr_D']:.6f}")
-            print(f"Train Loss: {train_losses['g_loss'] + train_losses['d_loss']:.4f} | Val Loss: {val_losses['g_loss'] + val_losses['d_loss']:.4f}")
+            print(f"Train Loss: {train_losses['generator_loss'] + train_losses['discriminator_loss']:.4f} | Val Loss: {val_losses['g_loss'] + val_losses['d_loss']:.4f}")
             
             # Print detailed metrics
             print("\nTrain Metrics:")
@@ -485,6 +467,9 @@ class CycleGANTrainer:
                 print(f"\n🛑 Early stopping triggered after {self.epochs_without_improvement} epochs without improvement")
                 print(f"🏆 Best SSIM achieved: {self.best_ssim:.4f}")
                 break
+            
+            # Cập nhật current_epoch sau khi hoàn thành epoch
+            self.current_epoch = epoch + 1
             
             # Save checkpoint
             if (epoch + 1) % self.config['save_freq'] == 0:
@@ -580,8 +565,8 @@ def main():
         
         # Training parameters - Learning rate thấp hơn để tránh collapse
         'num_epochs': 200,        
-        'lr_G': 0.00005,          # Giảm từ 0.0002 xuống 0.00005
-        'lr_D': 0.00005,          # Giảm từ 0.0002 xuống 0.00005  
+        'lr_G': 0.0001,          # Giảm từ 0.0002 xuống 0.0001
+        'lr_D': 0.0001,          # Giảm từ 0.0002 xuống 0.0001  
         'beta1': 0.5,
         'beta2': 0.999,
         'decay_epoch': 50,        # Decay sớm hơn
@@ -593,8 +578,8 @@ def main():
         'sample_dir': 'samples',
         
         # Save frequencies - Với cached data training nhanh hơn
-        'save_freq': 2,           # Save mỗi 5 epochs
-        'sample_freq': 2          # Sample mỗi 5 epochs
+        'save_freq': 1,           # Save mỗi 5 epochs
+        'sample_freq': 1          # Sample mỗi 5 epochs
     }
     
     # Tạo thư mục cần thiết
@@ -605,8 +590,10 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Sử dụng device: {device}")
     
-    # Hỏi user có muốn resume training không
+    # Tìm và load checkpoint nếu có
     resume_training = True
+    checkpoint_path = None
+    
     if os.path.exists(config['checkpoint_dir']):
         # Kiểm tra xem có checkpoint nào không
         checkpoint_files = [f for f in os.listdir(config['checkpoint_dir']) 
@@ -616,7 +603,7 @@ def main():
             # Sắp xếp checkpoint files theo epoch number
             def extract_epoch(filename):
                 try:
-                    return int(filename.split('_epoch_')[1].split('.pth')[0])
+                    return int(filename.split('_')[2].split('.pth')[0])
                 except:
                     return -1
             
@@ -624,19 +611,22 @@ def main():
             latest_checkpoint_file = sorted_checkpoints[-1]
             latest_epoch = extract_epoch(latest_checkpoint_file)
             
-            print(f"\n🔍 Tìm thấy {len(checkpoint_files)} checkpoint trong thư mục:")
+            print(f"\n🔍 Tìm thấy {len(checkpoint_files)} checkpoints:")
             # Hiển thị 3 checkpoint gần nhất với epoch numbers
             for f in sorted_checkpoints[-3:]:
                 epoch_num = extract_epoch(f)
                 print(f"   - {f} (epoch {epoch_num})")
             
-            print(f"\n🎯 Checkpoint gần nhất: {latest_checkpoint_file} (epoch {latest_epoch})")
+            print(f"📁 Latest checkpoint: {latest_checkpoint_file} (epoch {latest_epoch})")
             
             choice = input("\n❓ Bạn có muốn tiếp tục training từ checkpoint gần nhất? (y/n): ").lower().strip()
             resume_training = choice in ['y', 'yes', '1', 'true', '']
             
-            if not resume_training:
+            if resume_training:
+                checkpoint_path = os.path.join(config['checkpoint_dir'], latest_checkpoint_file)
+            else:
                 print("⚠️  Sẽ bắt đầu training từ đầu (checkpoint cũ sẽ không bị xóa)")
+                resume_training = False
     
     # Kiểm tra cache tồn tại
     if not os.path.exists(config['cache_dir']):
@@ -707,18 +697,18 @@ def main():
         
         if slices_per_patient >= 80:
             # Very high data - cần LR rất thấp
-            config['lr_G'] = 0.000025
-            config['lr_D'] = 0.000025
+            config['lr_G'] = 0.00004
+            config['lr_D'] = 0.00004
             print(f"   🔧 Adjusted LR to {config['lr_G']} (Very High Data)")
         elif slices_per_patient >= 50:
             # High data - LR thấp
-            config['lr_G'] = 0.00003
-            config['lr_D'] = 0.00003
+            config['lr_G'] = 0.00005
+            config['lr_D'] = 0.00005
             print(f"   🔧 Adjusted LR to {config['lr_G']} (High Data)")
         elif slices_per_patient >= 20:
             # Moderate data - LR moderate
-            config['lr_G'] = 0.00004
-            config['lr_D'] = 0.00004
+            config['lr_G'] = 0.00008
+            config['lr_D'] = 0.00008
             print(f"   🔧 Adjusted LR to {config['lr_G']} (Moderate Data)")
         else:
             # Low data - keep default
@@ -728,7 +718,7 @@ def main():
         original_batch_size = config['batch_size']
         if slices_per_patient >= 50:
             # Giảm batch size để fit memory với nhiều data
-            config['batch_size'] = 2
+            config['batch_size'] = 3
             print(f"   🔧 Adjusted batch size to {config['batch_size']} (High Data Volume)")
         
         print(f"\n🚀 Đang tạo MULTI-SLICE cached data loaders với {slices_per_patient} slices/patient...")
@@ -793,7 +783,7 @@ def main():
         )
     
     # Khởi tạo trainer
-    trainer = CycleGANTrainer(config, device, resume_from_checkpoint=resume_training)
+    trainer = CycleGANTrainer(config, device, resume_from_checkpoint=resume_training, checkpoint_path=checkpoint_path)
     
     # CRITICAL FIX: Reset learning rates nếu đã adjust cho multi-slice
     if loading_strategy == "multi_slice" and resume_training:
@@ -809,6 +799,16 @@ def main():
         print(f"🔧 Reset learning rates after checkpoint loading:")
         print(f"   LR_G: {current_lr_g}")
         print(f"   LR_D: {current_lr_d}")
+    
+    # Debug training state
+    print(f"🚀 TRAINING STATE DEBUG:")
+    print(f"   - Current epoch (từ checkpoint): {trainer.current_epoch}")
+    print(f"   - Sẽ bắt đầu training từ epoch: {trainer.current_epoch + 1}")
+    print(f"   - Target epochs: {config['num_epochs']}")
+    
+    # IMPORTANT: Đặt lại current_epoch về 0-indexed để training loop chạy đúng
+    if trainer.current_epoch > 0:
+        trainer.current_epoch -= 1
     
     # Hiển thị initial learning rates
     initial_lr = trainer.get_current_lr()
