@@ -41,13 +41,13 @@ class Generator(nn.Module):
             nn.ReLU(inplace=True)
         ]
         
-        # Downsampling layers
+        # Downsampling layers - BATCH_SIZE=7 OPTIMIZED
         in_features = 64
         out_features = in_features * 2
         for _ in range(2):
             model += [
                 nn.Conv2d(in_features, out_features, 3, stride=2, padding=1),
-                nn.InstanceNorm2d(out_features),
+                nn.BatchNorm2d(out_features),  # Changed: InstanceNorm2d → BatchNorm2d for batch_size=7
                 nn.ReLU(inplace=True)
             ]
             in_features = out_features
@@ -57,12 +57,12 @@ class Generator(nn.Module):
         for _ in range(n_residual_blocks):
             model += [ResidualBlock(in_features)]
         
-        # Decoder (upsampling)
+        # Decoder (upsampling) - BATCH_SIZE=7 OPTIMIZED
         out_features = in_features // 2
         for _ in range(2):
             model += [
                 nn.ConvTranspose2d(in_features, out_features, 3, stride=2, padding=1, output_padding=1),
-                nn.InstanceNorm2d(out_features),
+                nn.BatchNorm2d(out_features),  # Changed: InstanceNorm2d → BatchNorm2d for batch_size=7
                 nn.ReLU(inplace=True)
             ]
             in_features = out_features
@@ -102,7 +102,7 @@ class PatchGANDiscriminator(nn.Module):
             nf_mult = min(2 ** n, 8)
             model += [
                 nn.Conv2d(64 * nf_mult_prev, 64 * nf_mult, 4, stride=2, padding=1),
-                nn.InstanceNorm2d(64 * nf_mult),
+                nn.BatchNorm2d(64 * nf_mult),  # Changed: InstanceNorm2d → BatchNorm2d for batch_size=7
                 nn.LeakyReLU(0.2, inplace=True)
             ]
         
@@ -110,7 +110,7 @@ class PatchGANDiscriminator(nn.Module):
         nf_mult = min(2 ** n_layers, 8)
         model += [
             nn.Conv2d(64 * nf_mult_prev, 64 * nf_mult, 4, stride=1, padding=1),
-            nn.InstanceNorm2d(64 * nf_mult),
+            nn.BatchNorm2d(64 * nf_mult),  # Changed: InstanceNorm2d → BatchNorm2d for batch_size=7
             nn.LeakyReLU(0.2, inplace=True)
         ]
         
@@ -226,11 +226,21 @@ class CycleGAN(nn.Module):
         # Perceptual loss với resize=False để giữ nguyên kích thước ảnh
         self.perceptual_loss = VGGPerceptualLoss(resize=False)
         
-        # Loss weights - điều chỉnh cho medical imaging
-        self.lambda_cycle = 10.0      # Cycle consistency - quan trọng nhất
-        self.lambda_identity = 5.0    # Identity loss - giữ cấu trúc anatomical  
-        self.lambda_perceptual = 2.0  # Perceptual loss - tăng để cải thiện visual quality
-        self.lambda_adversarial = 1.0 # Adversarial loss - cơ bản
+        # SSIM calculator - khởi tạo 1 lần thay vì trong training loop
+        try:
+            from torchmetrics import StructuralSimilarityIndexMeasure
+            # Data sẽ được convert về [0,1] trước khi tính SSIM
+            self.ssim_calc = StructuralSimilarityIndexMeasure(data_range=1.0).cuda()
+        except:
+            self.ssim_calc = None
+            print("⚠️ Warning: SSIM calculator không khả dụng, sẽ fallback về L1-only")
+        
+        # Loss weights - RESEARCH-BASED OPTIMIZATION for Full Slice Training
+        # Dựa trên CycleGAN paper (λ=10) và enhanced cycle loss multiplier (1.6x)
+        self.lambda_cycle = 7.0       # Adjusted: 10.0/1.6≈7.0 (effective: 11.2)
+        self.lambda_identity = 0.0    # Disabled for cross-modal medical imaging
+        self.lambda_perceptual = 10.0 # Increased for high visual quality
+        self.lambda_adversarial = 5.0 # Strong adversarial for medical realism
         
     def forward(self, mri, ct):
         """
@@ -243,18 +253,19 @@ class CycleGAN(nn.Module):
         # Cycle consistency
         rec_mri = self.G_CT2MRI(fake_ct)
         rec_ct = self.G_MRI2CT(fake_mri)
-        
-        # Identity mapping (giúp bảo toàn cấu trúc anatomical)
-        identity_ct = self.G_MRI2CT(ct)
-        identity_mri = self.G_CT2MRI(mri)
+    
+        # ✅ IDENTITY LOSS HOÀN TOÀN DISABLED CHO Y TẾ
+        # Trong medical imaging: MRI và CT là hai modality khác nhau hoàn toàn
+        # Identity mapping không có ý nghĩa khi input và output domains khác biệt cơ bản
+        # => Không tính identity loss
         
         return {
             'fake_ct': fake_ct,
             'fake_mri': fake_mri,
             'rec_mri': rec_mri,
             'rec_ct': rec_ct,
-            'identity_ct': identity_ct,
-            'identity_mri': identity_mri
+            'identity_ct': None,  # Disabled
+            'identity_mri': None  # Disabled
         }
     
     def generator_loss(self, real_mri, real_ct, outputs):
@@ -265,8 +276,6 @@ class CycleGAN(nn.Module):
         fake_mri = outputs['fake_mri'] 
         rec_mri = outputs['rec_mri']
         rec_ct = outputs['rec_ct']
-        identity_ct = outputs['identity_ct']
-        identity_mri = outputs['identity_mri']
         
         # 1. Adversarial loss - Generator cố gắng đánh lừa Discriminator
         pred_fake_ct = self.D_CT(fake_ct)
@@ -277,30 +286,96 @@ class CycleGAN(nn.Module):
         loss_gan_mri = F.mse_loss(pred_fake_mri, torch.ones_like(pred_fake_mri))
         loss_gan = (loss_gan_ct + loss_gan_mri) * 0.5
         
-        # 2. Cycle consistency loss - F(G(x)) ≈ x và G(F(y)) ≈ y
-        loss_cycle_mri = F.l1_loss(rec_mri, real_mri)
-        loss_cycle_ct = F.l1_loss(rec_ct, real_ct)
-        loss_cycle = (loss_cycle_mri + loss_cycle_ct) * 0.5
+        # 2. Enhanced Cycle Consistency Loss với SSIM + Gradient
+        # Theo nghiên cứu: L1 + SSIM + Gradient cho visual quality tốt hơn
+        loss_cycle_l1_mri = F.l1_loss(rec_mri, real_mri)
+        loss_cycle_l1_ct = F.l1_loss(rec_ct, real_ct)
         
-        # 3. Identity loss - G(y) ≈ y và F(x) ≈ x (giữ cấu trúc khi input đã đúng domain)
-        loss_identity_ct = F.l1_loss(identity_ct, real_ct)
-        loss_identity_mri = F.l1_loss(identity_mri, real_mri)
-        loss_identity = (loss_identity_ct + loss_identity_mri) * 0.5
+        # Thêm SSIM loss cho cycle consistency (key improvement!)
+        if self.ssim_calc is not None:
+            try:
+                # Sử dụng SSIM calculator đã khởi tạo trong __init__
+                # Đảm bảo tensor có đúng device
+                rec_mri_cuda = rec_mri.to(self.ssim_calc.device)
+                real_mri_cuda = real_mri.to(self.ssim_calc.device)
+                rec_ct_cuda = rec_ct.to(self.ssim_calc.device)
+                real_ct_cuda = real_ct.to(self.ssim_calc.device)
+                
+                # Convert từ [-1,1] về [0,1] cho SSIM calculation
+                rec_mri_01 = (rec_mri_cuda + 1.0) / 2.0
+                real_mri_01 = (real_mri_cuda + 1.0) / 2.0
+                rec_ct_01 = (rec_ct_cuda + 1.0) / 2.0
+                real_ct_01 = (real_ct_cuda + 1.0) / 2.0
+                
+                # Clamp để đảm bảo trong [0,1] range
+                rec_mri_01 = torch.clamp(rec_mri_01, 0.0, 1.0)
+                real_mri_01 = torch.clamp(real_mri_01, 0.0, 1.0)
+                rec_ct_01 = torch.clamp(rec_ct_01, 0.0, 1.0)
+                real_ct_01 = torch.clamp(real_ct_01, 0.0, 1.0)
+                
+                # Tính SSIM score (0-1, 1 = perfect similarity)
+                ssim_mri = self.ssim_calc(rec_mri_01, real_mri_01)
+                ssim_ct = self.ssim_calc(rec_ct_01, real_ct_01)
+                
+                # SSIM loss = 1 - SSIM (0 = perfect, 1 = worst)
+                loss_cycle_ssim = (1.0 - ssim_mri) + (1.0 - ssim_ct)
+                
+                # Gradient loss để preserve edges (quan trọng cho medical imaging)
+                def gradient_loss(pred, target):
+                    # Sobel operators để tính gradient
+                    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(pred.device)
+                    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(pred.device)
+                    
+                    # Tính gradient cho prediction và target
+                    pred_grad_x = F.conv2d(pred, sobel_x, padding=1)
+                    pred_grad_y = F.conv2d(pred, sobel_y, padding=1)
+                    target_grad_x = F.conv2d(target, sobel_x, padding=1)
+                    target_grad_y = F.conv2d(target, sobel_y, padding=1)
+                    
+                    # Gradient magnitude
+                    pred_grad = torch.sqrt(pred_grad_x**2 + pred_grad_y**2 + 1e-8)
+                    target_grad = torch.sqrt(target_grad_x**2 + target_grad_y**2 + 1e-8)
+                    
+                    return F.l1_loss(pred_grad, target_grad)
+                
+                # Tính gradient loss cho cả MRI và CT
+                loss_grad_mri = gradient_loss(rec_mri, real_mri)
+                loss_grad_ct = gradient_loss(rec_ct, real_ct)
+                loss_cycle_gradient = (loss_grad_mri + loss_grad_ct) * 0.5
+                
+                # Combined enhanced cycle loss: L1 + α*SSIM + β*Gradient
+                # Theo nghiên cứu breakthrough SSIM strategy
+                alpha_ssim = 0.4      # Tăng weight cho SSIM để breakthrough
+                beta_gradient = 0.2   # Weight cho gradient preservation
+                
+                loss_cycle = ((loss_cycle_l1_mri + loss_cycle_l1_ct) * 0.5 + 
+                             alpha_ssim * loss_cycle_ssim +
+                             beta_gradient * loss_cycle_gradient)
+                             
+            except Exception as e:
+                # Fallback to L1 only if SSIM fails
+                print(f"⚠️ SSIM calculation failed: {e}")
+                loss_cycle = (loss_cycle_l1_mri + loss_cycle_l1_ct) * 0.5
+        else:
+            # Fallback to L1 only if SSIM calculator không khả dụng
+            loss_cycle = (loss_cycle_l1_mri + loss_cycle_l1_ct) * 0.5
+        
+        # 3. Identity loss - HOÀN TOÀN LOẠI BỎ cho medical imaging
+        loss_identity = torch.tensor(0.0, device=real_mri.device, requires_grad=True)
         
         # 4. Perceptual loss - chỉ áp dụng cho direction chính (MRI->CT)
         loss_perceptual = self.perceptual_loss(fake_ct, real_ct)
         
-        # Total generator loss với trọng số đã điều chỉnh
+        # Total generator loss - KHÔNG BAO GỒM identity loss
         total_loss = (self.lambda_adversarial * loss_gan + 
                      self.lambda_cycle * loss_cycle +
-                     self.lambda_identity * loss_identity +
                      self.lambda_perceptual * loss_perceptual)
         
         return {
             'total': total_loss,
             'gan': loss_gan,
             'cycle': loss_cycle,
-            'identity': loss_identity,
+            'identity': loss_identity,  # Luôn = 0
             'perceptual': loss_perceptual
         }
     
@@ -328,7 +403,8 @@ class CycleGAN(nn.Module):
     
     def _single_discriminator_loss(self, real_images, fake_images, discriminator):
         """
-        Tính Discriminator loss cho một discriminator (LSGAN loss cho ổn định)
+        Tính Discriminator loss cho một discriminator với RESEARCH-BASED scaling
+        LSGAN loss cho ổn định + 0.5x scaling để balance G-D training
         """
         # Real images - target = 1
         pred_real = discriminator(real_images)
@@ -338,10 +414,41 @@ class CycleGAN(nn.Module):
         pred_fake = discriminator(fake_images.detach())
         loss_fake = F.mse_loss(pred_fake, torch.zeros_like(pred_fake))
         
-        # Total discriminator loss
-        total_loss = (loss_real + loss_fake) * 0.5
+        # RESEARCH-BASED: 0.5x scaling để balance G-D training ratio
+        # Original CycleGAN paper: D loss được halved để tránh D dominance
+        total_loss = 0.5 * (loss_real + loss_fake)
         
         return total_loss
+
+    def update_loss_weights(self, lambda_cycle=None, lambda_identity=None, 
+                           lambda_perceptual=None, lambda_adversarial=None):
+        """
+        Dynamically update loss weights during training
+        Hữu ích khi cần fine-tune loss balance
+        """
+        if lambda_cycle is not None:
+            self.lambda_cycle = lambda_cycle
+        if lambda_identity is not None:
+            self.lambda_identity = lambda_identity
+        if lambda_perceptual is not None:
+            self.lambda_perceptual = lambda_perceptual
+        if lambda_adversarial is not None:
+            self.lambda_adversarial = lambda_adversarial
+            
+        print(f"🔄 Updated loss weights:")
+        print(f"   Cycle: {self.lambda_cycle}")
+        print(f"   Identity: {self.lambda_identity}")
+        print(f"   Perceptual: {self.lambda_perceptual}")
+        print(f"   Adversarial: {self.lambda_adversarial}")
+    
+    def get_loss_weights_info(self):
+        """Return current loss weights as dict"""
+        return {
+            'lambda_cycle': self.lambda_cycle,
+            'lambda_identity': self.lambda_identity,
+            'lambda_perceptual': self.lambda_perceptual,
+            'lambda_adversarial': self.lambda_adversarial
+        }
 
 
 def weights_init_normal(m):

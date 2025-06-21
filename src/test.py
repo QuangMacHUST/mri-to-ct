@@ -150,10 +150,157 @@ class MRIToCTTester:
             final_mask = morphology.binary_dilation(conservative_mask, kernel_conservative)
         
         return final_mask.astype(np.float32)
+    
+    def _apply_mri_mask_to_ct(self, ct_array: np.ndarray, mri_mask: np.ndarray) -> np.ndarray:
+        """
+        Áp dụng MRI mask vào CT để loại bỏ headframe và couch
+        """
+        from skimage import morphology
         
+        # Step 1: Apply MRI mask để loại bỏ couch/headframe
+        masked_ct = ct_array.copy()
+        
+        # Tạo realistic background value (air-like)
+        background_region = ct_array[mri_mask == 0]
+        if len(background_region) > 0:
+            # Air value trong CT thường là -1000 HU, dùng percentile thấp
+            background_value = np.percentile(background_region, 10)  # More realistic air value
+            # Ensure không quá extreme
+            background_value = max(background_value, ct_array.min())
+        else:
+            background_value = ct_array.min()
+        
+        # Set vùng ngoài mask thành air-like value
+        masked_ct[mri_mask == 0] = background_value
+        
+        # Step 2: Improved metal artifact detection trong brain region
+        brain_region = masked_ct[mri_mask > 0]
+        if len(brain_region) > 0:
+            # Use more robust statistics
+            q95 = np.percentile(brain_region, 95)
+            q05 = np.percentile(brain_region, 5)
+            q50 = np.percentile(brain_region, 50)  # Median
+            
+            # More conservative thresholds để preserve normal tissue
+            metal_threshold = q95 + 2 * (q95 - q50)  # Detect extreme bright artifacts
+            air_threshold = q05 - 2 * (q50 - q05)    # Detect extreme dark artifacts
+            
+            # Create masks với conservative approach
+            metal_mask = (masked_ct > metal_threshold) & (mri_mask > 0)
+            air_mask = (masked_ct < air_threshold) & (mri_mask > 0)
+            
+            # Stricter size requirements để avoid removing normal tissue
+            metal_mask = morphology.remove_small_objects(metal_mask, min_size=1000)  # Larger size
+            air_mask = morphology.remove_small_objects(air_mask, min_size=1000)
+            
+            # Replace artifacts với tissue-appropriate values
+            if np.any(metal_mask):
+                # Metal artifacts -> median của normal brain tissue
+                normal_tissue_value = np.median(brain_region[(brain_region >= q05) & (brain_region <= q95)])
+                masked_ct[metal_mask] = normal_tissue_value
+                
+            if np.any(air_mask):
+                # Air artifacts -> CSF-like value (slightly above q05)
+                csf_value = np.percentile(brain_region, 20)  # Typical CSF range
+                masked_ct[air_mask] = csf_value
+        
+        return masked_ct
+    
+    def _gentle_outlier_clipping(self, image_array: np.ndarray, mask: np.ndarray, modality: str = 'CT') -> np.ndarray:
+        """
+        Gentle outlier removal chỉ loại bỏ extreme outliers, preserve normal tissue variation
+        """
+        # Chỉ xử lý vùng trong mask
+        brain_region = image_array[mask > 0]
+        
+        if len(brain_region) == 0:
+            return image_array
+        
+        # Conservative percentile thresholds
+        q01 = np.percentile(brain_region, 1)    # Very low threshold
+        q99 = np.percentile(brain_region, 99)   # Very high threshold
+        
+        # Chỉ clip extreme outliers
+        clipped_array = image_array.copy()
+        
+        # Áp dụng chỉ trong vùng mask
+        clipped_array[mask > 0] = np.clip(clipped_array[mask > 0], q01, q99)
+        
+        return clipped_array
+    
+    def _normalize_intensity(self, image_array: np.ndarray, mask: np.ndarray, modality: str = 'CT') -> np.ndarray:
+        """
+        Min-Max normalization trong brain region
+        """
+        normalized_array = image_array.copy()
+        
+        # Lấy values trong brain region
+        brain_values = image_array[mask > 0]
+        
+        if len(brain_values) == 0:
+            return normalized_array
+        
+        # Min-Max normalization
+        min_val = np.min(brain_values)
+        max_val = np.max(brain_values)
+        
+        if max_val > min_val:
+            # Normalize chỉ vùng brain
+            normalized_array[mask > 0] = (image_array[mask > 0] - min_val) / (max_val - min_val)
+        else:
+            # Nếu min == max, set về 0
+            normalized_array[mask > 0] = 0
+        
+        # Vùng ngoài mask giữ nguyên (background)
+        normalized_array[mask == 0] = 0
+        
+        return normalized_array
+    
+    def _crop_brain_roi(self, image_array: np.ndarray, mask: np.ndarray) -> tuple:
+        """
+        Crop về ROI chứa não, loại bỏ vùng ngoài không cần thiết
+        """
+        # Find bounding box của vùng não
+        brain_coords = np.where(mask > 0)
+        
+        if len(brain_coords[0]) == 0:
+            # Nếu không tìm thấy brain mask, return original
+            return image_array, mask
+        
+        # Lấy bounding box với padding
+        min_z, max_z = brain_coords[0].min(), brain_coords[0].max()
+        min_y, max_y = brain_coords[1].min(), brain_coords[1].max()  
+        min_x, max_x = brain_coords[2].min(), brain_coords[2].max()
+        
+        # Add padding để không crop quá sát
+        padding = 10
+        min_z = max(0, min_z - padding)
+        max_z = min(image_array.shape[0], max_z + padding)
+        min_y = max(0, min_y - padding)
+        max_y = min(image_array.shape[1], max_y + padding)
+        min_x = max(0, min_x - padding)
+        max_x = min(image_array.shape[2], max_x + padding)
+        
+        # Crop image và mask
+        cropped_image = image_array[min_z:max_z, min_y:max_y, min_x:max_x]
+        cropped_mask = mask[min_z:max_z, min_y:max_y, min_x:max_x]
+        
+        return cropped_image, cropped_mask
+    
+    def _apply_n4_bias_correction(self, image: sitk.Image) -> sitk.Image:
+        """
+        Áp dụng N4 bias field correction để loại bỏ bias field trong MRI
+        """
+        # Cast về float32 để tránh lỗi với 16-bit signed integer
+        image = sitk.Cast(image, sitk.sitkFloat32)
+        corrector = sitk.N4BiasFieldCorrectionImageFilter()
+        corrector.SetMaximumNumberOfIterations([50] * 4)
+        return corrector.Execute(image)
+    
     def test_single_image(self, mri_path: str, output_dir: str, save_comparison: bool = True) -> Dict[str, float]:
         """
-        Test trên một ảnh MRI đơn lẻ
+        Test trên một ảnh MRI đơn lẻ với comprehensive preprocessing pipeline
+        để loại bỏ headframe và couch
         
         Args:
             mri_path: đường dẫn tới file MRI
@@ -167,43 +314,43 @@ class MRIToCTTester:
         
         print(f"Đang xử lý {mri_path}...")
         
-        # Load và tiền xử lý MRI
+        # BƯỚC 1: Load ảnh MRI
         mri_sitk = sitk.ReadImage(mri_path)
+        
+        # BƯỚC 2: Áp dụng N4 bias correction
+        print("Áp dụng N4 bias correction...")
+        mri_sitk = self._apply_n4_bias_correction(mri_sitk)
         mri_array = sitk.GetArrayFromImage(mri_sitk).astype(np.float32)
         
-        # Áp dụng N4 bias correction
-        # Cast to float32 first để avoid pixel type error
-        mri_sitk = sitk.Cast(mri_sitk, sitk.sitkFloat32)
-        corrector = sitk.N4BiasFieldCorrectionImageFilter()
-        corrector.SetMaximumNumberOfIterations([50] * 4)
-        mri_sitk_corrected = corrector.Execute(mri_sitk)
-        mri_array = sitk.GetArrayFromImage(mri_sitk_corrected).astype(np.float32)
+        print(f"MRI shape: {mri_array.shape}")
         
-        # Tạo comprehensive brain+skull mask để preserve bone structures
-        from skimage import filters, morphology, measure
-        from scipy import ndimage
-        
+        # BƯỚC 3: Tạo comprehensive brain+skull mask để loại bỏ headframe và couch
+        print("Tạo brain+skull mask để loại bỏ headframe và couch...")
         binary_mask = self._create_brain_with_skull_mask(mri_array)
+        print(f"Brain mask tạo thành công với {np.sum(binary_mask)} voxels")
         
-        # Normalize intensity với Min-Max normalization
-        masked_values = mri_array[binary_mask > 0]
-        if len(masked_values) > 0:
-            min_val = np.min(masked_values)
-            max_val = np.max(masked_values)
-            if max_val > min_val:
-                # Min-Max normalization về [0, 1]
-                mri_array = (mri_array - min_val) / (max_val - min_val)
-            else:
-                # Trường hợp tất cả pixel có cùng giá trị
-                mri_array = np.zeros_like(mri_array)
+        # BƯỚC 4: Gentle outlier clipping để loại bỏ extreme artifacts
+        print("Áp dụng gentle outlier clipping...")
+        mri_array = self._gentle_outlier_clipping(mri_array, binary_mask, 'MRI')
         
-        # Áp dụng mask
-        mri_array = mri_array * binary_mask
+        # BƯỚC 5: Normalize intensity trong brain region với Min-Max
+        print("Normalize intensity với Min-Max trong brain region...")
+        mri_array = self._normalize_intensity(mri_array, binary_mask, 'MRI')
         
-        # Chuyển về [-1, 1] để phù hợp với Tanh activation của Generator
+        # BƯỚC 6: Crop brain ROI để tập trung vào vùng não
+        print("Crop brain ROI...")
+        original_shape = mri_array.shape
+        mri_array, binary_mask_cropped = self._crop_brain_roi(mri_array, binary_mask)
+        
+        print(f"Sau khi crop: {original_shape} -> {mri_array.shape}")
+        
+        # BƯỚC 7: Chuyển về [-1, 1] để phù hợp với Tanh activation của Generator
+        # Clip để đảm bảo trong [0,1] trước khi scale về [-1,1]
+        mri_array = np.clip(mri_array, 0, 1)
         mri_array = mri_array * 2.0 - 1.0
         
-        # Tạo CT mô phỏng cho từng slice
+        # BƯỚC 8: Tạo CT mô phỏng cho từng slice
+        print("Generating synthetic CT...")
         fake_ct_volume = np.zeros_like(mri_array)
         
         with torch.no_grad():
@@ -230,113 +377,250 @@ class MRIToCTTester:
                 
                 fake_ct_volume[slice_idx] = fake_ct_slice
         
-        # Lưu kết quả
+        # BƯỚC 9: Post-processing - đưa về kích thước gốc nếu đã crop
+        if fake_ct_volume.shape != original_shape:
+            print("Expanding kết quả về kích thước gốc...")
+            # Tạo volume gốc với background value
+            expanded_ct = np.full(original_shape, -1.0, dtype=np.float32)  # Background = -1 (air-like)
+            expanded_mri = np.full(original_shape, -1.0, dtype=np.float32)
+            
+            # Tìm vị trí để đặt cropped volume vào center
+            # Tính toán offset để center volume
+            pad_z = (original_shape[0] - fake_ct_volume.shape[0]) // 2
+            pad_y = (original_shape[1] - fake_ct_volume.shape[1]) // 2  
+            pad_x = (original_shape[2] - fake_ct_volume.shape[2]) // 2
+            
+            # Đảm bảo không vượt quá boundary
+            end_z = min(pad_z + fake_ct_volume.shape[0], original_shape[0])
+            end_y = min(pad_y + fake_ct_volume.shape[1], original_shape[1])
+            end_x = min(pad_x + fake_ct_volume.shape[2], original_shape[2])
+            
+            # Place cropped volume vào vị trí center
+            expanded_ct[pad_z:end_z, pad_y:end_y, pad_x:end_x] = fake_ct_volume
+            expanded_mri[pad_z:end_z, pad_y:end_y, pad_x:end_x] = mri_array
+            
+            fake_ct_volume = expanded_ct
+            mri_array = expanded_mri
+        
+        # BƯỚC 10: Lưu kết quả
         filename = os.path.basename(mri_path).replace('.nii.gz', '_synthetic_ct.nii.gz')
         output_path = os.path.join(output_dir, filename)
         save_nifti_image(fake_ct_volume, output_path, mri_path)
         
         # Lưu ảnh so sánh cho slice giữa
         if save_comparison:
-            middle_slice = mri_array.shape[0] // 2
+            middle_slice = fake_ct_volume.shape[0] // 2
             comparison_path = os.path.join(output_dir, filename.replace('.nii.gz', '_comparison.png'))
+            
+            # Convert về [0,1] để display
+            mri_display = np.clip((mri_array[middle_slice] + 1.0) / 2.0, 0, 1)
+            ct_display = np.clip((fake_ct_volume[middle_slice] + 1.0) / 2.0, 0, 1)
+            
             compare_images(
-                mri_array[middle_slice], 
-                fake_ct_volume[middle_slice],
+                mri_display, 
+                ct_display,
                 comparison_path,
-                "MRI Input",
+                "MRI Input (Preprocessed)",
                 "Synthetic CT"
             )
         
         print(f"CT mô phỏng đã được lưu tại: {output_path}")
+        print("Preprocessing pipeline hoàn thành:")
+        print("  ✓ N4 bias correction")
+        print("  ✓ Brain+skull mask tạo để loại bỏ headframe/couch")
+        print("  ✓ Gentle outlier clipping")
+        print("  ✓ Min-Max normalization trong brain region")
+        print("  ✓ Brain ROI cropping")
+        print("  ✓ Synthetic CT generation")
+        
         return {}
         
     def test_with_ground_truth(self, mri_path: str, ct_path: str, output_dir: str) -> Dict[str, float]:
         """
-        Test với ground truth CT để tính metrics
+        Test với ground truth CT và tính toán metrics
+        Áp dụng MRI mask vào CT để loại bỏ headframe và couch
         """
+        print(f"Testing với ground truth: MRI={os.path.basename(mri_path)}, CT={os.path.basename(ct_path)}")
+        
+        # Tạo output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Tạo CT mô phỏng
-        self.test_single_image(mri_path, output_dir, save_comparison=False)
-        
-        # Load ground truth CT
+        # BƯỚC 1: Load ảnh MRI và CT
+        mri_sitk = sitk.ReadImage(mri_path)
         ct_sitk = sitk.ReadImage(ct_path)
+        
+        # BƯỚC 2: N4 bias correction cho MRI
+        mri_sitk = self._apply_n4_bias_correction(mri_sitk)
+        
+        # Chuyển về numpy
+        mri_array = sitk.GetArrayFromImage(mri_sitk).astype(np.float32)
         ct_array = sitk.GetArrayFromImage(ct_sitk).astype(np.float32)
         
-        # Load synthetic CT
-        synthetic_ct_path = os.path.join(output_dir, 
-                                        os.path.basename(mri_path).replace('.nii.gz', '_synthetic_ct.nii.gz'))
-        synthetic_ct_sitk = sitk.ReadImage(synthetic_ct_path)
-        synthetic_ct_array = sitk.GetArrayFromImage(synthetic_ct_sitk).astype(np.float32)
+        print(f"MRI shape: {mri_array.shape}, CT shape: {ct_array.shape}")
         
-        # Chuẩn hóa cả hai ảnh về cùng range
-        ct_array = (ct_array - ct_array.min()) / (ct_array.max() - ct_array.min() + 1e-8)
-        synthetic_ct_array = (synthetic_ct_array - synthetic_ct_array.min()) / (synthetic_ct_array.max() - synthetic_ct_array.min() + 1e-8)
+        # BƯỚC 3: Tạo comprehensive mask từ MRI (brain + skull, không có couch/headframe)
+        mri_mask = self._create_brain_with_skull_mask(mri_array)
+        print(f"Tạo MRI mask thành công với {np.sum(mri_mask)} voxels")
         
-        # Chuyển về tensor để tính metrics
-        ct_tensor = torch.tensor(ct_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        synthetic_ct_tensor = torch.tensor(synthetic_ct_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        # BƯỚC 4: Áp dụng MRI mask vào CT để loại bỏ couch/headframe
+        print("Áp dụng MRI mask vào CT để loại bỏ headframe và couch...")
+        ct_array = self._apply_mri_mask_to_ct(ct_array, mri_mask)
         
-        # Tính metrics
-        metrics = MetricsCalculator.calculate_all_metrics(synthetic_ct_tensor, ct_tensor)
+        # BƯỚC 5: Gentle outlier clipping
+        mri_array = self._gentle_outlier_clipping(mri_array, mri_mask, 'MRI')
+        ct_array = self._gentle_outlier_clipping(ct_array, mri_mask, 'CT')
         
-        # Lưu ảnh so sánh với ground truth
-        middle_slice = ct_array.shape[0] // 2
-        comparison_path = os.path.join(output_dir, 
-                                      os.path.basename(mri_path).replace('.nii.gz', '_gt_comparison.png'))
+        # BƯỚC 6: Normalize intensity trong brain region
+        mri_array = self._normalize_intensity(mri_array, mri_mask, 'MRI')
+        ct_array = self._normalize_intensity(ct_array, mri_mask, 'CT')  # Sử dụng cùng mask
         
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        # BƯỚC 7: Crop brain ROI
+        mri_array, mri_mask_cropped = self._crop_brain_roi(mri_array, mri_mask)
+        ct_array, _ = self._crop_brain_roi(ct_array, mri_mask)  # Sử dụng cùng original mask
         
-        # Load MRI để hiển thị
-        mri_sitk = sitk.ReadImage(mri_path)
-        mri_array = sitk.GetArrayFromImage(mri_sitk).astype(np.float32)
-        mri_array = (mri_array - mri_array.min()) / (mri_array.max() - mri_array.min() + 1e-8)
+        print(f"Sau khi crop: MRI shape: {mri_array.shape}, CT shape: {ct_array.shape}")
         
-        axes[0].imshow(mri_array[middle_slice], cmap='gray')
-        axes[0].set_title('Input MRI')
-        axes[0].axis('off')
+        # BƯỚC 8: Lấy slice giữa để test
+        slice_idx = mri_array.shape[0] // 2
+        mri_slice = mri_array[slice_idx]
+        ct_slice = ct_array[slice_idx]
+        mask_slice = mri_mask_cropped[slice_idx]
         
-        axes[1].imshow(synthetic_ct_array[middle_slice], cmap='gray')
-        axes[1].set_title('Synthetic CT')
-        axes[1].axis('off')
+        # BƯỚC 9: Resize về 256x256
+        if mri_slice.shape != (256, 256):
+            from scipy.ndimage import zoom
+            zoom_h = 256 / mri_slice.shape[0]
+            zoom_w = 256 / mri_slice.shape[1]
+            mri_slice = zoom(mri_slice, (zoom_h, zoom_w), order=1, mode='constant', cval=0)
+            ct_slice = zoom(ct_slice, (zoom_h, zoom_w), order=1, mode='constant', cval=0)
+            mask_slice = zoom(mask_slice, (zoom_h, zoom_w), order=0, mode='constant', cval=0)
         
-        axes[2].imshow(ct_array[middle_slice], cmap='gray')
-        axes[2].set_title('Ground Truth CT')
-        axes[2].axis('off')
+        # BƯỚC 10: Normalize về [-1, 1] cho model
+        mri_slice = np.clip(mri_slice, 0, 1)
+        ct_slice = np.clip(ct_slice, 0, 1)
+        mri_slice = mri_slice * 2.0 - 1.0
+        ct_slice = ct_slice * 2.0 - 1.0
         
-        diff = np.abs(synthetic_ct_array[middle_slice] - ct_array[middle_slice])
-        im = axes[3].imshow(diff, cmap='hot')
-        axes[3].set_title('Difference Map')
-        axes[3].axis('off')
-        plt.colorbar(im, ax=axes[3])
+        # BƯỚC 11: Chuyển về tensor
+        mri_tensor = torch.tensor(mri_slice, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        # BƯỚC 12: Generate synthetic CT
+        with torch.no_grad():
+            fake_ct = self.model.G_MRI2CT(mri_tensor)
+            fake_ct = fake_ct.cpu().numpy()[0, 0]
+        
+        # BƯỚC 13: Convert về [0, 1] để tính metrics
+        real_ct = (ct_slice + 1.0) / 2.0
+        fake_ct = (fake_ct + 1.0) / 2.0
+        mri_display = (mri_slice + 1.0) / 2.0
+        
+        # Clip về [0, 1]
+        real_ct = np.clip(real_ct, 0, 1)
+        fake_ct = np.clip(fake_ct, 0, 1)
+        mri_display = np.clip(mri_display, 0, 1)
+        
+        # BƯỚC 14: Tính toán metrics
+        metrics_calc = MetricsCalculator()
+        
+        # Chỉ tính metrics trong vùng brain (có mask)
+        brain_region = mask_slice > 0.1  # Threshold để tạo binary mask
+        
+        if np.sum(brain_region) > 0:
+            mae = metrics_calc.calculate_mae(real_ct[brain_region], fake_ct[brain_region])
+            mse = metrics_calc.calculate_mse(real_ct[brain_region], fake_ct[brain_region])
+            rmse = metrics_calc.calculate_rmse(real_ct[brain_region], fake_ct[brain_region])
+            psnr = metrics_calc.calculate_psnr(real_ct[brain_region], fake_ct[brain_region])
+            ssim = metrics_calc.calculate_ssim(real_ct, fake_ct, brain_region)
+            ncc = metrics_calc.calculate_ncc(real_ct[brain_region], fake_ct[brain_region])
+        else:
+            print("Warning: Không tìm thấy brain region để tính metrics")
+            mae = mse = rmse = psnr = ssim = ncc = 0.0
+        
+        metrics = {
+            'MAE': mae,
+            'MSE': mse,
+            'RMSE': rmse,
+            'PSNR': psnr,
+            'SSIM': ssim,
+            'NCC': ncc
+        }
+        
+        # BƯỚC 15: Lưu kết quả
+        filename = os.path.basename(mri_path).replace('.nii.gz', '')
+        
+        # Tạo comparison image
+        comparison_path = os.path.join(output_dir, f"{filename}_comparison_with_mask_applied.png")
+        plt.figure(figsize=(20, 5))
+        
+        # MRI
+        plt.subplot(1, 4, 1)
+        plt.imshow(mri_display, cmap='gray')
+        plt.title('Input MRI')
+        plt.axis('off')
+        
+        # Real CT (with mask applied)
+        plt.subplot(1, 4, 2)
+        plt.imshow(real_ct, cmap='gray')
+        plt.title('Real CT\n(Mask Applied)')
+        plt.axis('off')
+        
+        # Synthetic CT
+        plt.subplot(1, 4, 3)
+        plt.imshow(fake_ct, cmap='gray')
+        plt.title('Synthetic CT')
+        plt.axis('off')
+        
+        # Brain mask
+        plt.subplot(1, 4, 4)
+        plt.imshow(mask_slice, cmap='gray')
+        plt.title('Brain Mask')
+        plt.axis('off')
+        
+        # Thêm metrics text
+        metrics_text = f"MAE: {mae:.4f}\nMSE: {mse:.4f}\nRMSE: {rmse:.4f}\nPSNR: {psnr:.2f}dB\nSSIM: {ssim:.4f}\nNCC: {ncc:.4f}"
+        plt.figtext(0.02, 0.02, metrics_text, fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
         
         plt.tight_layout()
         plt.savefig(comparison_path, dpi=150, bbox_inches='tight')
         plt.close()
         
+        print(f"Đã lưu comparison với mask applied tại: {comparison_path}")
+        print(f"Metrics (trong brain region): MAE={mae:.4f}, SSIM={ssim:.4f}, PSNR={psnr:.2f}dB")
+        
         return metrics
     
     def test_dataset(self, test_loader: DataLoader, output_dir: str) -> Dict[str, float]:
         """
-        Test trên toàn bộ test dataset
+        Test trên toàn bộ test dataset với MRI mask được áp dụng
         """
         os.makedirs(output_dir, exist_ok=True)
         
         all_metrics = []
         
         print("Đang test trên toàn bộ dataset...")
+        print("Lưu ý: Dataset loader đã áp dụng MRI mask vào CT preprocessing")
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(test_loader, desc="Testing")):
                 mri = batch['mri'].to(self.device)
                 ct_real = batch['ct'].to(self.device)
+                mask = batch.get('mask', None)  # Lấy mask nếu có
                 filename = batch['filename'][0]  # Batch size = 1 cho test
                 
                 # Generate synthetic CT
                 ct_fake = self.model.G_MRI2CT(mri)
                 
-                # Tính metrics
-                metrics = MetricsCalculator.calculate_all_metrics(ct_fake, ct_real)
+                # Nếu có mask, áp dụng vào metrics
+                if mask is not None:
+                    mask = mask.to(self.device)
+                    # Tính metrics chỉ trong vùng mask
+                    ct_real_masked = ct_real * mask
+                    ct_fake_masked = ct_fake * mask
+                    metrics = MetricsCalculator.calculate_all_metrics(ct_fake_masked, ct_real_masked)
+                else:
+                    # Fallback về metrics toàn bộ nếu không có mask
+                    metrics = MetricsCalculator.calculate_all_metrics(ct_fake, ct_real)
+                
                 all_metrics.append(metrics)
                 
                 # Lưu ảnh so sánh cho một số sample
@@ -347,25 +631,68 @@ class MRIToCTTester:
                     ct_real_np = ct_real[0, 0].cpu().numpy()
                     ct_fake_np = ct_fake[0, 0].cpu().numpy()
                     
-                    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-                    
-                    axes[0].imshow(mri_np, cmap='gray')
-                    axes[0].set_title('Input MRI')
-                    axes[0].axis('off')
-                    
-                    axes[1].imshow(ct_fake_np, cmap='gray')
-                    axes[1].set_title('Synthetic CT')
-                    axes[1].axis('off')
-                    
-                    axes[2].imshow(ct_real_np, cmap='gray')
-                    axes[2].set_title('Ground Truth CT')
-                    axes[2].axis('off')
-                    
-                    diff = np.abs(ct_fake_np - ct_real_np)
-                    im = axes[3].imshow(diff, cmap='hot')
-                    axes[3].set_title(f'Difference (MAE: {metrics["MAE"]:.4f})')
-                    axes[3].axis('off')
-                    plt.colorbar(im, ax=axes[3])
+                    if mask is not None:
+                        mask_np = mask[0, 0].cpu().numpy()
+                        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+                        
+                        # Row 1: Input, Outputs, Ground Truth
+                        axes[0, 0].imshow(mri_np, cmap='gray')
+                        axes[0, 0].set_title('Input MRI')
+                        axes[0, 0].axis('off')
+                        
+                        axes[0, 1].imshow(ct_fake_np, cmap='gray')
+                        axes[0, 1].set_title('Synthetic CT')
+                        axes[0, 1].axis('off')
+                        
+                        axes[0, 2].imshow(ct_real_np, cmap='gray')
+                        axes[0, 2].set_title('Ground Truth CT (Masked)')
+                        axes[0, 2].axis('off')
+                        
+                        # Row 2: Mask, Difference Map, Metrics
+                        axes[1, 0].imshow(mask_np, cmap='gray')
+                        axes[1, 0].set_title('Brain+Skull Mask')
+                        axes[1, 0].axis('off')
+                        
+                        diff = np.abs(ct_fake_np - ct_real_np) * mask_np
+                        im = axes[1, 1].imshow(diff, cmap='hot')
+                        axes[1, 1].set_title(f'Difference Map (MAE: {metrics["MAE"]:.4f})')
+                        axes[1, 1].axis('off')
+                        plt.colorbar(im, ax=axes[1, 1])
+                        
+                        # Metrics text
+                        metrics_text = f"""Metrics (Brain Region):
+MAE: {metrics['MAE']:.4f}
+MSE: {metrics['MSE']:.4f}
+RMSE: {metrics['RMSE']:.4f}
+PSNR: {metrics['PSNR']:.2f} dB
+SSIM: {metrics['SSIM']:.4f}
+NCC: {metrics['NCC']:.4f}"""
+                        
+                        axes[1, 2].text(0.1, 0.5, metrics_text, fontsize=12, verticalalignment='center',
+                                       bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+                        axes[1, 2].axis('off')
+                        
+                    else:
+                        # Fallback layout nếu không có mask
+                        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+                        
+                        axes[0].imshow(mri_np, cmap='gray')
+                        axes[0].set_title('Input MRI')
+                        axes[0].axis('off')
+                        
+                        axes[1].imshow(ct_fake_np, cmap='gray')
+                        axes[1].set_title('Synthetic CT')
+                        axes[1].axis('off')
+                        
+                        axes[2].imshow(ct_real_np, cmap='gray')
+                        axes[2].set_title('Ground Truth CT')
+                        axes[2].axis('off')
+                        
+                        diff = np.abs(ct_fake_np - ct_real_np)
+                        im = axes[3].imshow(diff, cmap='hot')
+                        axes[3].set_title(f'Difference (MAE: {metrics["MAE"]:.4f})')
+                        axes[3].axis('off')
+                        plt.colorbar(im, ax=axes[3])
                     
                     plt.tight_layout()
                     plt.savefig(save_path, dpi=150, bbox_inches='tight')

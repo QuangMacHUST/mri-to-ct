@@ -41,6 +41,91 @@ class MetricsCalculator:
         return F.l1_loss(pred, target).item()
     
     @staticmethod
+    def calculate_mae(pred, target) -> float:
+        """
+        Alias cho mean_absolute_error với xử lý numpy arrays
+        """
+        if isinstance(pred, np.ndarray):
+            pred = torch.from_numpy(pred).float()
+        if isinstance(target, np.ndarray):
+            target = torch.from_numpy(target).float()
+        return MetricsCalculator.mean_absolute_error(pred, target)
+    
+    @staticmethod
+    def calculate_mse(pred, target) -> float:
+        """
+        Alias cho mean_squared_error với xử lý numpy arrays
+        """
+        if isinstance(pred, np.ndarray):
+            pred = torch.from_numpy(pred).float()
+        if isinstance(target, np.ndarray):
+            target = torch.from_numpy(target).float()
+        return MetricsCalculator.mean_squared_error(pred, target)
+    
+    @staticmethod
+    def calculate_rmse(pred, target) -> float:
+        """
+        Alias cho root_mean_squared_error với xử lý numpy arrays
+        """
+        if isinstance(pred, np.ndarray):
+            pred = torch.from_numpy(pred).float()
+        if isinstance(target, np.ndarray):
+            target = torch.from_numpy(target).float()
+        return MetricsCalculator.root_mean_squared_error(pred, target)
+    
+    @staticmethod
+    def calculate_psnr(pred, target, max_value: float = 2.0) -> float:
+        """
+        Alias cho peak_signal_to_noise_ratio với xử lý numpy arrays
+        """
+        if isinstance(pred, np.ndarray):
+            pred = torch.from_numpy(pred).float()
+        if isinstance(target, np.ndarray):
+            target = torch.from_numpy(target).float()
+        return MetricsCalculator.peak_signal_to_noise_ratio(pred, target, max_value)
+    
+    @staticmethod
+    def calculate_ssim(pred, target, mask=None) -> float:
+        """
+        Alias cho structural_similarity_index với xử lý numpy arrays và mask
+        """
+        if isinstance(pred, np.ndarray):
+            # Nếu là 2D, expand thành batch format [1, 1, H, W]
+            if pred.ndim == 2:
+                pred = torch.from_numpy(pred).float().unsqueeze(0).unsqueeze(0)
+            else:
+                pred = torch.from_numpy(pred).float()
+        if isinstance(target, np.ndarray):
+            if target.ndim == 2:
+                target = torch.from_numpy(target).float().unsqueeze(0).unsqueeze(0)
+            else:
+                target = torch.from_numpy(target).float()
+        
+        # Nếu có mask, áp dụng trước khi tính SSIM
+        if mask is not None:
+            if isinstance(mask, np.ndarray):
+                mask = torch.from_numpy(mask).float()
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)
+            
+            # Áp dụng mask
+            pred = pred * mask
+            target = target * mask
+            
+        return MetricsCalculator.structural_similarity_index(pred, target)
+    
+    @staticmethod
+    def calculate_ncc(pred, target) -> float:
+        """
+        Alias cho normalized_cross_correlation với xử lý numpy arrays
+        """
+        if isinstance(pred, np.ndarray):
+            pred = torch.from_numpy(pred).float().unsqueeze(0).unsqueeze(0)
+        if isinstance(target, np.ndarray):
+            target = torch.from_numpy(target).float().unsqueeze(0).unsqueeze(0)
+        return MetricsCalculator.normalized_cross_correlation(pred, target)
+    
+    @staticmethod
     def mean_squared_error(pred: torch.Tensor, target: torch.Tensor) -> float:
         """
         Tính Mean Squared Error (MSE)

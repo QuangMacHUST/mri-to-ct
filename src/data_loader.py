@@ -437,6 +437,7 @@ class MRIToCTDataset(Dataset):
         
         mri_slice = mri_array[slice_idx]
         ct_slice = ct_array[slice_idx]
+        mask_slice = mri_mask_cropped[slice_idx]  # Lấy mask slice tương ứng
         
         # BƯỚC 8: Resize
         if mri_slice.shape != (256, 256):
@@ -445,6 +446,7 @@ class MRIToCTDataset(Dataset):
             zoom_w = 256 / mri_slice.shape[1]
             mri_slice = zoom(mri_slice, (zoom_h, zoom_w), order=1, mode='constant', cval=0)
             ct_slice = zoom(ct_slice, (zoom_h, zoom_w), order=1, mode='constant', cval=0)
+            mask_slice = zoom(mask_slice, (zoom_h, zoom_w), order=0, mode='constant', cval=0)  # Mask với nearest neighbor
         
         # BƯỚC 9: Final clamp về [0,1]
         mri_slice = np.clip(mri_slice, 0, 1)
@@ -464,10 +466,12 @@ class MRIToCTDataset(Dataset):
         # Chuyển về tensor
         mri_tensor = torch.tensor(mri_slice, dtype=torch.float32).unsqueeze(0)
         ct_tensor = torch.tensor(ct_slice, dtype=torch.float32).unsqueeze(0)
+        mask_tensor = torch.tensor(mask_slice, dtype=torch.float32).unsqueeze(0)
         
         return {
             'mri': mri_tensor,
             'ct': ct_tensor,
+            'mask': mask_tensor,
             'filename': self.mri_files[idx]
         }
 

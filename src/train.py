@@ -67,19 +67,20 @@ class CycleGANTrainer:
             betas=(config['beta1'], config['beta2'])
         )
         
-        # Learning rate schedulers - Cosine annealing với warm restart
-        self.scheduler_G = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer_G, 
-            T_0=20,      # Restart mỗi 20 epochs
-            T_mult=2,    # Tăng cycle length x2 mỗi restart
-            eta_min=config['lr_G'] * 0.01  # Min LR = 1% của initial LR
+        # Learning rate schedulers - Linear decay như paper gốc + Cosine warmup
+        # Medical imaging GANs benefit from stable, gradual LR decay
+        self.scheduler_G = optim.lr_scheduler.LinearLR(
+            self.optimizer_G,
+            start_factor=1.0,
+            end_factor=0.1,     # Decay đến 10% của initial LR
+            total_iters=config['num_epochs'] // 2  # Decay trong nửa cuối training
         )
         
-        self.scheduler_D = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        self.scheduler_D = optim.lr_scheduler.LinearLR(
             self.optimizer_D,
-            T_0=20,
-            T_mult=2, 
-            eta_min=config['lr_D'] * 0.01
+            start_factor=1.0,
+            end_factor=0.1,
+            total_iters=config['num_epochs'] // 2
         )
         
         # Tensorboard writer
@@ -205,9 +206,8 @@ class CycleGANTrainer:
             
             self.optimizer_D.step()
             
-            # Update schedulers
-            self.scheduler_G.step()
-            self.scheduler_D.step()
+            # ❌ KHÔNG UPDATE SCHEDULER MỖI BATCH - SẼ UPDATE MỖI EPOCH!
+            # Scheduler update per batch sẽ khiến LR giảm quá nhanh
             
             # Accumulate losses
             total_g_loss += g_losses['total'].item()
@@ -552,7 +552,7 @@ def main():
     config = {
         # Data parameters  
         'cache_dir': '../preprocessed_cache',  # Sử dụng cached data
-        'batch_size': 3,          # Batch size nhỏ
+        'batch_size': 4,          # Batch size nhỏ
         'num_workers': 2,         # Tăng workers vì chỉ load cache
         'train_split': 0.8,
         'augmentation_prob': 0.8, # Xác suất augmentation
@@ -563,14 +563,16 @@ def main():
         'n_residual_blocks': 9,   
         'discriminator_layers': 3,
         
-        # Training parameters - Learning rate thấp hơn để tránh collapse
-        'num_epochs': 200,        
-        'lr_G': 0.0001,          # Giảm từ 0.0002 xuống 0.0001
-        'lr_D': 0.0001,          # Giảm từ 0.0002 xuống 0.0001  
-        'beta1': 0.5,
-        'beta2': 0.999,
-        'decay_epoch': 50,        # Decay sớm hơn
-        'decay_epochs': 50,
+        # Training parameters - Tối ưu dựa trên medical imaging research
+        # Medical imaging GANs thường dùng LR thấp hơn để tránh mode collapse
+        # Tham khảo: CLADE paper dùng 2e-4 với Adam, StarGAN medical dùng 1e-4
+        'num_epochs': 150,        # Tăng epochs do medical data cần convergence từ từ
+        'lr_G': 0.0001,          # Giảm Generator LR - medical images cần fine-grained learning
+        'lr_D': 0.0001,          # Giảm Discriminator LR đồng bộ với Generator
+        'beta1': 0.5,            # Standard cho GAN stability  
+        'beta2': 0.999,          # Standard Adam beta2
+        'decay_epoch': 75,        # Bắt đầu decay tại epoch 75 (50% của 150 epochs)
+        'decay_epochs': 75,       # Decay trong 75 epochs cuối
         
         # Directories
         'checkpoint_dir': 'checkpoints',
@@ -718,7 +720,7 @@ def main():
         original_batch_size = config['batch_size']
         if slices_per_patient >= 50:
             # Giảm batch size để fit memory với nhiều data
-            config['batch_size'] = 3
+            config['batch_size'] = 4
             print(f"   🔧 Adjusted batch size to {config['batch_size']} (High Data Volume)")
         
         print(f"\n🚀 Đang tạo MULTI-SLICE cached data loaders với {slices_per_patient} slices/patient...")
@@ -757,7 +759,7 @@ def main():
             batch_size=config['batch_size'],
             train_split=config['train_split'],
             num_workers=config['num_workers'],
-            slice_sampling_strategy="middle_range",  # Lấy 60% slices ở giữa
+            slice_sampling_strategy="every_nth",  # Lấy 60% slices ở giữa
             max_slices_per_patient=30,              # Tối đa 30 slices/bệnh nhân
             augmentation_prob=config['augmentation_prob']
         )
