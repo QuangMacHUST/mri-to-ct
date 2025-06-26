@@ -41,7 +41,17 @@ class CycleGANTrainer:
         self.current_epoch = 0
         self.best_ssim = 0.0
         self.epochs_without_improvement = 0
-        self.max_patience = 15  # Early stopping patience
+        self.max_patience = 25  # Early stopping patience
+        
+        # Gradient explosion monitoring
+        self.gradient_explosion_count = 0
+        self.max_explosion_per_epoch = 50  # Cho phép tối đa 50 explosions/epoch
+        self.min_lr_threshold = 1e-7  # Minimum learning rate threshold
+        
+        # EMERGENCY: Warmup strategy to prevent early explosions
+        self.warmup_epochs = 5  # Warmup trong 5 epochs đầu
+        self.initial_lr_G = config['lr_G']
+        self.initial_lr_D = config['lr_D']
         
         # Khởi tạo model
         self.model = CycleGAN(
@@ -55,32 +65,32 @@ class CycleGANTrainer:
         self.model.apply(weights_init_normal)
         
         # Optimizers với learning rate thấp hơn
-        self.optimizer_G = optim.Adam(
+        self.optimizer_G = optim.AdamW(
             list(self.model.G_MRI2CT.parameters()) + list(self.model.G_CT2MRI.parameters()),
             lr=config['lr_G'],
-            betas=(config['beta1'], config['beta2'])
+            betas=(config['beta1'], config['beta2']),
+            weight_decay= 0.00001
         )
         
-        self.optimizer_D = optim.Adam(
+        self.optimizer_D = optim.AdamW(
             list(self.model.D_CT.parameters()) + list(self.model.D_MRI.parameters()),
             lr=config['lr_D'],
-            betas=(config['beta1'], config['beta2'])
+            betas=(config['beta1'], config['beta2']),
+            weight_decay= 0.00001
         )
         
         # Learning rate schedulers - Linear decay như paper gốc + Cosine warmup
         # Medical imaging GANs benefit from stable, gradual LR decay
-        self.scheduler_G = optim.lr_scheduler.LinearLR(
+        self.scheduler_G = optim.lr_scheduler.StepLR(
             self.optimizer_G,
-            start_factor=1.0,
-            end_factor=0.1,     # Decay đến 10% của initial LR
-            total_iters=config['num_epochs'] // 2  # Decay trong nửa cuối training
+            step_size=30,
+            gamma=0.8
         )
         
-        self.scheduler_D = optim.lr_scheduler.LinearLR(
+        self.scheduler_D = optim.lr_scheduler.StepLR(
             self.optimizer_D,
-            start_factor=1.0,
-            end_factor=0.1,
-            total_iters=config['num_epochs'] // 2
+            step_size=30,
+            gamma=0.9
         )
         
         # Tensorboard writer
@@ -150,6 +160,14 @@ class CycleGANTrainer:
         # Training metrics
         total_g_loss = 0.0
         total_d_loss = 0.0
+        
+        # Chi tiết từng loại loss
+        total_adv_loss = 0.0
+        total_cycle_loss = 0.0
+        total_perceptual_loss = 0.0
+        total_d_ct_loss = 0.0
+        total_d_mri_loss = 0.0
+        
         total_metrics = {
             'mae': 0.0, 'mse': 0.0, 'rmse': 0.0, 
             'psnr': 0.0, 'ssim': 0.0, 'ncc': 0.0
@@ -163,14 +181,23 @@ class CycleGANTrainer:
         pbar = tqdm(train_loader, 
                    desc=f"Training Epoch {self.current_epoch+1}: LR_G={current_lr['lr_G']:.6f}")
         
+        # Reset gradient explosion count cho epoch mới  
+        self.gradient_explosion_count = 0
+        
         for i, batch in enumerate(pbar):
             real_mri = batch['mri'].to(self.device)
             real_ct = batch['ct'].to(self.device)
+            
+            # Check nếu quá nhiều gradient explosions trong epoch này
+            if self.gradient_explosion_count > self.max_explosion_per_epoch:
+                print(f"🚨 Quá nhiều gradient explosions ({self.gradient_explosion_count}), dừng epoch sớm!")
+                break
             
             # Kiểm tra gradient explosion trước khi training
             if self._check_gradient_explosion():
                 print(f"⚠️  Phát hiện gradient explosion tại batch {i}, đặt lại learning rate...")
                 self._reset_learning_rate()
+                self.gradient_explosion_count += 1
                 continue
                 
             # =============== Train Generator ===============
@@ -183,11 +210,25 @@ class CycleGANTrainer:
             g_losses = self.model.generator_loss(real_mri, real_ct, outputs)
             g_losses['total'].backward()
             
-            # Gradient clipping cho Generator với adaptive norm
+            # ULTRA AGGRESSIVE gradient clipping - Medical imaging needs stability
             grad_norm_g = torch.nn.utils.clip_grad_norm_(
                 list(self.model.G_MRI2CT.parameters()) + list(self.model.G_CT2MRI.parameters()),
-                max_norm=5.0  
+                max_norm=2.0  # RESTORE: 0.1 → 2.0 để model có thể học hiệu quả hơn 
             )
+            
+            # Check for gradient explosion với threshold hợp lý
+            if grad_norm_g > 10.0:  # RESTORE: 1.0 → 10.0 để giảm false positives
+                print(f"⚠️ Generator gradient explosion detected: {grad_norm_g:.2f}")
+                self.gradient_explosion_count += 1
+                # MODERATE RESPONSE: Giảm LR nhẹ hơn
+                for g in self.optimizer_G.param_groups:
+                    g['lr'] *= 0.8  # MODERATE: 0.5 → 0.8 để không giảm quá mạnh
+                    # Emergency brake: Nếu LR quá thấp, set về threshold minimum
+                    if g['lr'] < self.min_lr_threshold:
+                        g['lr'] = self.min_lr_threshold
+                        print(f"🔴 Generator LR hit minimum threshold: {self.min_lr_threshold}")
+                self.optimizer_G.zero_grad()
+                continue
             
             self.optimizer_G.step()
             
@@ -198,20 +239,41 @@ class CycleGANTrainer:
             d_losses = self.model.discriminator_loss(real_mri, real_ct, outputs)
             d_losses['total'].backward()
             
-            # Gradient clipping cho Discriminator
+            # ULTRA AGGRESSIVE gradient clipping cho Discriminator 
             grad_norm_d = torch.nn.utils.clip_grad_norm_(
                 list(self.model.D_CT.parameters()) + list(self.model.D_MRI.parameters()),
-                max_norm=5.0
+                max_norm=2.0  # RESTORE: 0.1 → 2.0 để model có thể học hiệu quả hơn
             )
+            
+            # Check for gradient explosion với threshold hợp lý  
+            if grad_norm_d > 10.0:  # RESTORE: 1.0 → 10.0 để giảm false positives
+                print(f"⚠️ Discriminator gradient explosion detected: {grad_norm_d:.2f}")
+                self.gradient_explosion_count += 1
+                # MODERATE RESPONSE: Giảm LR nhẹ hơn
+                for g in self.optimizer_D.param_groups:
+                    g['lr'] *= 0.8  # MODERATE: 0.5 → 0.8 để không giảm quá mạnh
+                    # Emergency brake: Nếu LR quá thấp, set về threshold minimum
+                    if g['lr'] < self.min_lr_threshold:
+                        g['lr'] = self.min_lr_threshold
+                        print(f"🔴 Discriminator LR hit minimum threshold: {self.min_lr_threshold}")
+                self.optimizer_D.zero_grad()
+                continue
             
             self.optimizer_D.step()
             
             # ❌ KHÔNG UPDATE SCHEDULER MỖI BATCH - SẼ UPDATE MỖI EPOCH!
             # Scheduler update per batch sẽ khiến LR giảm quá nhanh
             
-            # Accumulate losses
+            # Accumulate losses - tổng
             total_g_loss += g_losses['total'].item()
             total_d_loss += d_losses['total'].item()
+            
+            # Accumulate chi tiết từng loại loss
+            total_adv_loss += g_losses['gan'].item()
+            total_cycle_loss += g_losses['cycle'].item()
+            total_perceptual_loss += g_losses['perceptual'].item()
+            total_d_ct_loss += d_losses['D_CT'].item()
+            total_d_mri_loss += d_losses['D_MRI'].item()
             
             # Tính metrics cho batch hiện tại
             with torch.no_grad():
@@ -234,23 +296,37 @@ class CycleGANTrainer:
                     if metric_key_mapping[key] in batch_metrics:
                         total_metrics[key] += batch_metrics[metric_key_mapping[key]]
             
-            # Cập nhật progress bar với metrics đầy đủ
+            # Cập nhật progress bar với chi tiết loss components
             pbar.set_postfix({
                 'G_loss': f"{g_losses['total'].item():.4f}",
+                'Adv': f"{g_losses['gan'].item():.4f}",
+                'Cyc': f"{g_losses['cycle'].item():.4f}",
+                'Perc': f"{g_losses['perceptual'].item():.4f}",
                 'D_loss': f"{d_losses['total'].item():.4f}",
-                'SSIM': f"{batch_metrics['SSIM']:.4f}",
-                'MAE': f"{batch_metrics['MAE']:.4f}",
-                'PSNR': f"{batch_metrics['PSNR']:.2f}"
+                'SSIM': f"{batch_metrics['SSIM']:.4f}"
             })
         
         # Average metrics over epoch
         avg_g_loss = total_g_loss / num_batches
         avg_d_loss = total_d_loss / num_batches
+        
+        # Average chi tiết các loss components
+        avg_adv_loss = total_adv_loss / num_batches
+        avg_cycle_loss = total_cycle_loss / num_batches
+        avg_perceptual_loss = total_perceptual_loss / num_batches
+        avg_d_ct_loss = total_d_ct_loss / num_batches
+        avg_d_mri_loss = total_d_mri_loss / num_batches
+        
         avg_metrics = {key: value / num_batches for key, value in total_metrics.items()}
         
         return {
             'generator_loss': avg_g_loss,
             'discriminator_loss': avg_d_loss,
+            'adversarial_loss': avg_adv_loss,
+            'cycle_loss': avg_cycle_loss,
+            'perceptual_loss': avg_perceptual_loss,
+            'd_ct_loss': avg_d_ct_loss,
+            'd_mri_loss': avg_d_mri_loss,
             **avg_metrics
         }
     
@@ -272,13 +348,19 @@ class CycleGANTrainer:
     
     def validate_epoch(self, val_loader) -> Dict[str, float]:
         """
-        Validation một epoch
+        Validation một epoch với chi tiết loss components
         """
         self.model.eval()
         
         # Validation metrics
         total_g_loss = 0.0
         total_d_loss = 0.0
+        
+        # Chi tiết validation loss components  
+        total_val_adv_loss = 0.0
+        total_val_cycle_loss = 0.0
+        total_val_perceptual_loss = 0.0
+        
         total_metrics = {
             'mae': 0.0, 'mse': 0.0, 'rmse': 0.0, 
             'psnr': 0.0, 'ssim': 0.0, 'ncc': 0.0
@@ -297,8 +379,13 @@ class CycleGANTrainer:
                 # Generator loss (không cần discriminator loss trong validation)
                 g_losses = self.model.generator_loss(real_mri, real_ct, outputs)
                 
-                # Accumulate losses
+                # Accumulate losses - tổng
                 total_g_loss += g_losses['total'].item()
+                
+                # Accumulate validation loss components
+                total_val_adv_loss += g_losses['gan'].item()
+                total_val_cycle_loss += g_losses['cycle'].item()
+                total_val_perceptual_loss += g_losses['perceptual'].item()
                 
                 # Compute metrics cho fake_ct
                 metrics_calculator = MetricsCalculator()
@@ -324,6 +411,11 @@ class CycleGANTrainer:
         avg_g_loss = total_g_loss / num_batches
         avg_d_loss = 0.0  # Không có D loss trong validation
         
+        # Average validation loss components
+        avg_val_adv_loss = total_val_adv_loss / num_batches
+        avg_val_cycle_loss = total_val_cycle_loss / num_batches
+        avg_val_perceptual_loss = total_val_perceptual_loss / num_batches
+        
         avg_metrics = {}
         for key in total_metrics:
             avg_metrics[key] = total_metrics[key] / num_batches
@@ -331,6 +423,9 @@ class CycleGANTrainer:
         return {
             'g_loss': avg_g_loss,
             'd_loss': avg_d_loss,
+            'val_adversarial_loss': avg_val_adv_loss,
+            'val_cycle_loss': avg_val_cycle_loss,
+            'val_perceptual_loss': avg_val_perceptual_loss,
             **avg_metrics
         }
     
@@ -338,15 +433,27 @@ class CycleGANTrainer:
                           train_losses: Dict[str, float],
                           val_losses: Dict[str, float]):
         """
-        Ghi log vào tensorboard
+        Ghi log vào tensorboard với chi tiết loss components
         """
-        # Training losses
+        # Training losses - tổng
         self.writer.add_scalar('Loss/Train_G', train_losses['generator_loss'], self.current_epoch)
         self.writer.add_scalar('Loss/Train_D', train_losses['discriminator_loss'], self.current_epoch)
         
-        # Validation losses
+        # Training losses - chi tiết components
+        self.writer.add_scalar('Loss_Components/Adversarial_Loss', train_losses['adversarial_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss_Components/Cycle_Loss', train_losses['cycle_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss_Components/Perceptual_Loss', train_losses['perceptual_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss_Components/D_CT_Loss', train_losses['d_ct_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss_Components/D_MRI_Loss', train_losses['d_mri_loss'], self.current_epoch)
+        
+        # Validation losses - tổng
         self.writer.add_scalar('Loss/Val_G', val_losses['g_loss'], self.current_epoch)
         self.writer.add_scalar('Loss/Val_D', val_losses['d_loss'], self.current_epoch)
+        
+        # Validation losses - chi tiết components
+        self.writer.add_scalar('Loss_Components/Val_Adversarial_Loss', val_losses['val_adversarial_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss_Components/Val_Cycle_Loss', val_losses['val_cycle_loss'], self.current_epoch)
+        self.writer.add_scalar('Loss_Components/Val_Perceptual_Loss', val_losses['val_perceptual_loss'], self.current_epoch)
         
         # Training metrics
         for metric_name in ['mae', 'mse', 'rmse', 'psnr', 'ssim', 'ncc']:
@@ -395,6 +502,20 @@ class CycleGANTrainer:
         for epoch in range(self.current_epoch, self.config['num_epochs']):
             epoch_start_time = time.time()
             
+            # EMERGENCY WARMUP: Gradually increase LR trong epochs đầu
+            if epoch < self.warmup_epochs:
+                warmup_factor = (epoch + 1) / self.warmup_epochs
+                current_lr_G = self.initial_lr_G * warmup_factor * 0.1  # Start từ 10% initial LR
+                current_lr_D = self.initial_lr_D * warmup_factor * 0.1
+                
+                # Set warmed-up learning rates
+                for g in self.optimizer_G.param_groups:
+                    g['lr'] = current_lr_G
+                for g in self.optimizer_D.param_groups:
+                    g['lr'] = current_lr_D
+                    
+                print(f"🔥 WARMUP Epoch {epoch+1}/{self.warmup_epochs}: LR_G={current_lr_G:.8f}, LR_D={current_lr_D:.8f}")
+            
             # Training
             train_losses = self.train_epoch(train_loader)
             
@@ -409,6 +530,18 @@ class CycleGANTrainer:
             print(f"\nEpoch {epoch+1}/{self.config['num_epochs']} - Time: {epoch_time:.2f}s")
             print(f"LR_G: {current_lr['lr_G']:.6f} | LR_D: {current_lr['lr_D']:.6f}")
             print(f"Train Loss: {train_losses['generator_loss'] + train_losses['discriminator_loss']:.4f} | Val Loss: {val_losses['g_loss'] + val_losses['d_loss']:.4f}")
+            
+            # Print chi tiết loss components
+            print("\nLoss Components Details:")
+            print("=" * 50)
+            print(f"Generator Loss Total: {train_losses['generator_loss']:.4f}")
+            print(f"  ├── Adversarial Loss: {train_losses['adversarial_loss']:.4f}")
+            print(f"  ├── Cycle Loss:      {train_losses['cycle_loss']:.4f}")
+            print(f"  └── Perceptual Loss: {train_losses['perceptual_loss']:.4f}")
+            print(f"Discriminator Loss Total: {train_losses['discriminator_loss']:.4f}")
+            print(f"  ├── D_CT Loss:       {train_losses['d_ct_loss']:.4f}")
+            print(f"  └── D_MRI Loss:      {train_losses['d_mri_loss']:.4f}")
+            print("=" * 50)
             
             # Print detailed metrics
             print("\nTrain Metrics:")
@@ -555,7 +688,7 @@ def main():
         'batch_size': 4,          # Batch size nhỏ
         'num_workers': 2,         # Tăng workers vì chỉ load cache
         'train_split': 0.8,
-        'augmentation_prob': 0.8, # Xác suất augmentation
+        'augmentation_prob': 0.6, # Xác suất augmentation
         
         # Model parameters - Tối ưu với cached data
         'input_nc': 1,
@@ -563,14 +696,14 @@ def main():
         'n_residual_blocks': 9,   
         'discriminator_layers': 3,
         
-        # Training parameters - Tối ưu dựa trên medical imaging research
+        # Training parameters - EMERGENCY ULTRA CONSERVATIVE
         # Medical imaging GANs thường dùng LR thấp hơn để tránh mode collapse
-        # Tham khảo: CLADE paper dùng 2e-4 với Adam, StarGAN medical dùng 1e-4
+        # EMERGENCY: Giảm LR xuống cực thấp để hoàn toàn prevent gradient explosion
         'num_epochs': 150,        # Tăng epochs do medical data cần convergence từ từ
-        'lr_G': 0.0001,          # Giảm Generator LR - medical images cần fine-grained learning
-        'lr_D': 0.0001,          # Giảm Discriminator LR đồng bộ với Generator
-        'beta1': 0.5,            # Standard cho GAN stability  
-        'beta2': 0.999,          # Standard Adam beta2
+        'lr_G': 0.000005,        # EMERGENCY: 0.00002 → 0.000005 (4x thấp hơn nữa!)
+        'lr_D': 0.000002,        # EMERGENCY: 0.00001 → 0.000002 (5x thấp hơn nữa!)
+        'beta1': 0.9,            # FIX SSIM PLATEAU: Tăng từ 0.5 → 0.9 (medical imaging needs higher momentum)
+        'beta2': 0.99,            # FIX SSIM PLATEAU: Giảm từ 0.999 → 0.9 (prevent second-moment accumulation)
         'decay_epoch': 75,        # Bắt đầu decay tại epoch 75 (50% của 150 epochs)
         'decay_epochs': 75,       # Decay trong 75 epochs cuối
         

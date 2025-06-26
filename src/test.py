@@ -39,13 +39,29 @@ class MRIToCTTester:
         # Load checkpoint
         checkpoint = torch.load(model_path, map_location=self.device)
         
-        # Khôi phục config từ checkpoint
-        config = checkpoint.get('config', {
-            'input_nc': 1,
-            'output_nc': 1,
-            'n_residual_blocks': 9,
-            'discriminator_layers': 3
-        })
+        # Khôi phục config từ checkpoint (đảm bảo sử dụng config thật từ checkpoint)
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+        else:
+            # Fallback config nếu không có trong checkpoint
+            # Thử detect từ model size - best_model_new.pth có 12 residual blocks
+            if 'new' in model_path:
+                config = {
+                    'input_nc': 1,
+                    'output_nc': 1,
+                    'n_residual_blocks': 12,  # Model mới có 12 blocks
+                    'discriminator_layers': 3
+                }
+            else:
+                config = {
+                    'input_nc': 1,
+                    'output_nc': 1,
+                    'n_residual_blocks': 9,  # Model cũ có 9 blocks
+                    'discriminator_layers': 3
+                }
+        
+        print(f"Config từ checkpoint: {config}")
+        print(f"Sử dụng n_residual_blocks: {config['n_residual_blocks']}")
         
         # Khởi tạo model
         self.model = CycleGAN(
@@ -576,8 +592,9 @@ class MRIToCTTester:
         plt.title('Brain Mask')
         plt.axis('off')
         
-        # Thêm metrics text
-        metrics_text = f"MAE: {mae:.4f}\nMSE: {mse:.4f}\nRMSE: {rmse:.4f}\nPSNR: {psnr:.2f}dB\nSSIM: {ssim:.4f}\nNCC: {ncc:.4f}"
+        # Thêm metrics text bao gồm DICE score
+        dice = metrics.get('DICE', 0.0)
+        metrics_text = f"MAE: {mae:.4f}\nMSE: {mse:.4f}\nRMSE: {rmse:.4f}\nPSNR: {psnr:.2f}dB\nSSIM: {ssim:.4f}\nNCC: {ncc:.4f}\nDICE: {dice:.4f}"
         plt.figtext(0.02, 0.02, metrics_text, fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
         
         plt.tight_layout()
@@ -585,7 +602,8 @@ class MRIToCTTester:
         plt.close()
         
         print(f"Đã lưu comparison với mask applied tại: {comparison_path}")
-        print(f"Metrics (trong brain region): MAE={mae:.4f}, SSIM={ssim:.4f}, PSNR={psnr:.2f}dB")
+        dice = metrics.get('DICE', 0.0)
+        print(f"Metrics (trong brain region): MAE={mae:.4f}, SSIM={ssim:.4f}, PSNR={psnr:.2f}dB, DICE={dice:.4f}")
         
         return metrics
     
@@ -616,7 +634,7 @@ class MRIToCTTester:
                     # Tính metrics chỉ trong vùng mask
                     ct_real_masked = ct_real * mask
                     ct_fake_masked = ct_fake * mask
-                    metrics = MetricsCalculator.calculate_all_metrics(ct_fake_masked, ct_real_masked)
+                    metrics = MetricsCalculator.calculate_all_metrics(ct_fake_masked, ct_real_masked, mask=mask)
                 else:
                     # Fallback về metrics toàn bộ nếu không có mask
                     metrics = MetricsCalculator.calculate_all_metrics(ct_fake, ct_real)
@@ -659,14 +677,15 @@ class MRIToCTTester:
                         axes[1, 1].axis('off')
                         plt.colorbar(im, ax=axes[1, 1])
                         
-                        # Metrics text
+                        # Metrics text bao gồm DICE score
                         metrics_text = f"""Metrics (Brain Region):
 MAE: {metrics['MAE']:.4f}
 MSE: {metrics['MSE']:.4f}
 RMSE: {metrics['RMSE']:.4f}
 PSNR: {metrics['PSNR']:.2f} dB
 SSIM: {metrics['SSIM']:.4f}
-NCC: {metrics['NCC']:.4f}"""
+NCC: {metrics['NCC']:.4f}
+DICE: {metrics['DICE']:.4f}"""
                         
                         axes[1, 2].text(0.1, 0.5, metrics_text, fontsize=12, verticalalignment='center',
                                        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
@@ -705,12 +724,206 @@ NCC: {metrics['NCC']:.4f}"""
         
         return avg_metrics
 
+    def test_volumes_with_metrics(self, mri_dir: str, ct_dir: str, output_dir: str) -> Dict[str, float]:
+        """
+        Test toàn bộ volumes, tạo file nii.gz và tính metrics cho từng slice
+        Sau đó tính trung bình metrics trên tổng số slice
+        """
+        import glob
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Tìm tất cả file MRI và CT
+        mri_files = sorted(glob.glob(os.path.join(mri_dir, "*.nii.gz")))
+        ct_files = sorted(glob.glob(os.path.join(ct_dir, "*.nii.gz")))
+        
+        if len(mri_files) != len(ct_files):
+            print(f"Warning: Số lượng MRI files ({len(mri_files)}) != CT files ({len(ct_files)})")
+        
+        all_slice_metrics = []
+        volume_info = []
+        
+        print(f"Tìm thấy {len(mri_files)} volume pairs để test...")
+        
+        for mri_path, ct_path in zip(mri_files, ct_files):
+            volume_name = os.path.basename(mri_path).replace('.nii.gz', '')
+            print(f"\n{'='*50}")
+            print(f"Xử lý volume: {volume_name}")
+            print(f"{'='*50}")
+            
+            # Load và preprocess MRI
+            mri_sitk = sitk.ReadImage(mri_path)
+            ct_sitk = sitk.ReadImage(ct_path)
+            
+            # N4 bias correction
+            print("Áp dụng N4 bias correction...")
+            mri_sitk = self._apply_n4_bias_correction(mri_sitk)
+            
+            mri_array = sitk.GetArrayFromImage(mri_sitk).astype(np.float32)
+            ct_array = sitk.GetArrayFromImage(ct_sitk).astype(np.float32)
+            
+            print(f"Volume shape: {mri_array.shape}")
+            
+            # Tạo brain mask
+            print("Tạo brain+skull mask...")
+            mri_mask = self._create_brain_with_skull_mask(mri_array)
+            
+            # Áp dụng mask vào CT
+            print("Áp dụng MRI mask vào CT...")
+            ct_array = self._apply_mri_mask_to_ct(ct_array, mri_mask)
+            
+            # Gentle outlier clipping
+            mri_array = self._gentle_outlier_clipping(mri_array, mri_mask, 'MRI')
+            ct_array = self._gentle_outlier_clipping(ct_array, mri_mask, 'CT')
+            
+            # Normalize intensity
+            mri_array = self._normalize_intensity(mri_array, mri_mask, 'MRI')
+            ct_array = self._normalize_intensity(ct_array, mri_mask, 'CT')
+            
+            # Crop brain ROI
+            mri_array, mri_mask_cropped = self._crop_brain_roi(mri_array, mri_mask)
+            ct_array, _ = self._crop_brain_roi(ct_array, mri_mask)
+            
+            print(f"Sau crop: {mri_array.shape}")
+            
+            # Tạo synthetic CT cho toàn bộ volume
+            print("Generating synthetic CT volume...")
+            fake_ct_volume = np.zeros_like(mri_array)
+            
+            volume_slice_metrics = []
+            
+            with torch.no_grad():
+                for slice_idx in tqdm(range(mri_array.shape[0]), desc=f"Processing {volume_name}"):
+                    mri_slice = mri_array[slice_idx]
+                    ct_slice = ct_array[slice_idx]
+                    mask_slice = mri_mask_cropped[slice_idx]
+                    
+                    # Skip empty slices
+                    if np.sum(mask_slice) < 100:  # Quá ít brain tissue
+                        continue
+                    
+                    # Resize về 256x256 cho model
+                    if mri_slice.shape != (256, 256):
+                        mri_slice_resized = cv2.resize(mri_slice, (256, 256), interpolation=cv2.INTER_LINEAR)
+                        ct_slice_resized = cv2.resize(ct_slice, (256, 256), interpolation=cv2.INTER_LINEAR)
+                        mask_slice_resized = cv2.resize(mask_slice.astype(np.float32), (256, 256), interpolation=cv2.INTER_NEAREST)
+                    else:
+                        mri_slice_resized = mri_slice
+                        ct_slice_resized = ct_slice
+                        mask_slice_resized = mask_slice
+                    
+                    # Normalize về [-1, 1] cho model
+                    mri_slice_resized = np.clip(mri_slice_resized, 0, 1) * 2.0 - 1.0
+                    ct_slice_resized = np.clip(ct_slice_resized, 0, 1) * 2.0 - 1.0
+                    
+                    # Generate synthetic CT
+                    mri_tensor = torch.tensor(mri_slice_resized, dtype=torch.float32)
+                    mri_tensor = mri_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
+                    
+                    fake_ct_tensor = self.model.G_MRI2CT(mri_tensor)
+                    fake_ct_slice = fake_ct_tensor[0, 0].cpu().numpy()
+                    
+                    # Resize về kích thước gốc
+                    if fake_ct_slice.shape != mri_slice.shape:
+                        fake_ct_slice = cv2.resize(fake_ct_slice, mri_slice.shape[::-1], interpolation=cv2.INTER_LINEAR)
+                    
+                    fake_ct_volume[slice_idx] = fake_ct_slice
+                    
+                    # Tính metrics cho slice này
+                    # Convert về cùng range cho metrics calculation
+                    fake_ct_normalized = (fake_ct_slice + 1.0) / 2.0  # [-1,1] -> [0,1]
+                    ct_normalized = (ct_slice + 1.0) / 2.0
+                    mask_normalized = mask_slice.astype(np.float32)
+                    
+                    # Tính metrics chỉ trong brain region
+                    if np.sum(mask_normalized) > 50:  # Đủ brain tissue
+                        fake_ct_tensor_norm = torch.tensor(fake_ct_normalized).unsqueeze(0).unsqueeze(0).to(self.device)
+                        ct_tensor_norm = torch.tensor(ct_normalized).unsqueeze(0).unsqueeze(0).to(self.device)
+                        mask_tensor = torch.tensor(mask_normalized).unsqueeze(0).unsqueeze(0).to(self.device)
+                        
+                        slice_metrics = MetricsCalculator.calculate_all_metrics(
+                            fake_ct_tensor_norm, ct_tensor_norm, mask=mask_tensor
+                        )
+                        
+                        volume_slice_metrics.append(slice_metrics)
+                        all_slice_metrics.append(slice_metrics)
+            
+            # Lưu synthetic CT volume
+            ct_output_path = os.path.join(output_dir, f"{volume_name}_synthetic_ct.nii.gz")
+            
+            # Chuyển về HU units cho nii.gz (optional)
+            fake_ct_hu = (fake_ct_volume + 1.0) / 2.0 * 2000 - 1000  # [0,1] -> [-1000, 1000] HU
+            save_nifti_image(fake_ct_hu, ct_output_path, mri_path)
+            
+            # Tính metrics trung bình cho volume này
+            if volume_slice_metrics:
+                volume_avg_metrics = {}
+                for metric_name in volume_slice_metrics[0].keys():
+                    volume_avg_metrics[metric_name] = np.mean([m[metric_name] for m in volume_slice_metrics])
+                
+                volume_info.append({
+                    'volume': volume_name,
+                    'num_slices': len(volume_slice_metrics),
+                    'metrics': volume_avg_metrics
+                })
+                
+                print(f"\nMetrics cho {volume_name} ({len(volume_slice_metrics)} slices):")
+                print_metrics(volume_avg_metrics, f"{volume_name} Average")
+            
+            print(f"Đã lưu synthetic CT: {ct_output_path}")
+        
+        # Tính metrics trung bình cho toàn bộ dataset
+        if all_slice_metrics:
+            total_avg_metrics = {}
+            for metric_name in all_slice_metrics[0].keys():
+                total_avg_metrics[metric_name] = np.mean([m[metric_name] for m in all_slice_metrics])
+            
+            # Lưu summary report
+            summary_path = os.path.join(output_dir, "metrics_summary.txt")
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                f.write("METRICS SUMMARY REPORT\n")
+                f.write("="*50 + "\n\n")
+                
+                f.write(f"Tổng số slices đã xử lý: {len(all_slice_metrics)}\n")
+                f.write(f"Số volumes: {len(volume_info)}\n\n")
+                
+                f.write("METRICS TRUNG BÌNH TOÀN BỘ DATASET:\n")
+                f.write("-"*30 + "\n")
+                for metric_name, value in total_avg_metrics.items():
+                    if 'PSNR' in metric_name:
+                        f.write(f"{metric_name}: {value:.2f} dB\n")
+                    else:
+                        f.write(f"{metric_name}: {value:.4f}\n")
+                
+                f.write("\n\nMETRICS CHO TỪNG VOLUME:\n")
+                f.write("-"*30 + "\n")
+                for vol_info in volume_info:
+                    f.write(f"\n{vol_info['volume']} ({vol_info['num_slices']} slices):\n")
+                    for metric_name, value in vol_info['metrics'].items():
+                        if 'PSNR' in metric_name:
+                            f.write(f"  {metric_name}: {value:.2f} dB\n")
+                        else:
+                            f.write(f"  {metric_name}: {value:.4f}\n")
+            
+            print(f"\n{'='*60}")
+            print("METRICS TRUNG BÌNH TOÀN BỘ DATASET")
+            print(f"{'='*60}")
+            print(f"Tổng số slices: {len(all_slice_metrics)}")
+            print_metrics(total_avg_metrics, "Overall Average")
+            print(f"Chi tiết đã lưu tại: {summary_path}")
+            
+            return total_avg_metrics
+        
+        else:
+            print("Không có slice nào được xử lý!")
+            return {}
+
 
 def main():
     parser = argparse.ArgumentParser(description='Test CycleGAN MRI to CT model')
     parser.add_argument('--model_path', type=str, required=True,
                         help='Đường dẫn tới model checkpoint')
-    parser.add_argument('--test_mode', type=str, choices=['single', 'dataset', 'with_gt'], 
+    parser.add_argument('--test_mode', type=str, choices=['single', 'dataset', 'with_gt', 'volumes'], 
                         default='dataset', help='Chế độ test')
     parser.add_argument('--mri_path', type=str, help='Đường dẫn tới file MRI (cho single mode)')
     parser.add_argument('--ct_path', type=str, help='Đường dẫn tới file CT ground truth')
@@ -760,6 +973,10 @@ def main():
         
         # Test trên dataset
         metrics = tester.test_dataset(test_loader, args.output_dir)
+        print_metrics(metrics, "Average Test Results")
+    
+    elif args.test_mode == 'volumes':
+        metrics = tester.test_volumes_with_metrics(args.mri_dir, args.ct_dir, args.output_dir)
         print_metrics(metrics, "Average Test Results")
     
     print(f"Kết quả test đã được lưu tại: {args.output_dir}")

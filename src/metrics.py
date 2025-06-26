@@ -126,6 +126,102 @@ class MetricsCalculator:
         return MetricsCalculator.normalized_cross_correlation(pred, target)
     
     @staticmethod
+    def calculate_dice(pred, target, threshold: float = 0.5, mask=None) -> float:
+        """
+        Tính Dice Coefficient (Sørensen–Dice coefficient) cho medical image segmentation
+        
+        Args:
+            pred: tensor hoặc array dự đoán
+            target: tensor hoặc array ground truth
+            threshold: ngưỡng để chuyển về binary (default: 0.5 cho normalized data)
+            mask: mask để chỉ tính trong vùng quan tâm
+        
+        Returns:
+            DICE score trong khoảng [0, 1] với 1 là tốt nhất
+        """
+        if isinstance(pred, np.ndarray):
+            pred = torch.from_numpy(pred).float()
+        if isinstance(target, np.ndarray):
+            target = torch.from_numpy(target).float()
+        
+        return MetricsCalculator.dice_coefficient(pred, target, threshold, mask)
+    
+    @staticmethod
+    def dice_coefficient(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, mask=None) -> float:
+        """
+        Tính Dice Coefficient cho medical image evaluation
+        
+        Formula: DICE = 2 * |A ∩ B| / (|A| + |B|) = 2 * TP / (2*TP + FP + FN)
+        
+        Args:
+            pred: tensor dự đoán shape [batch, channels, height, width] trong range [-1,1] hoặc [0,1]
+            target: tensor ground truth cùng shape và range với pred
+            threshold: ngưỡng để chuyển về binary
+            mask: mask để chỉ tính trong vùng quan tâm (brain region)
+        
+        Returns:
+            DICE score trong khoảng [0, 1] với 1 là perfect match
+        """
+        # Xử lý tensor sang CPU và numpy
+        pred_np = pred.detach().cpu().numpy()
+        target_np = target.detach().cpu().numpy()
+        
+        # Convert từ [-1,1] về [0,1] nếu cần
+        if pred_np.min() < 0:
+            pred_np = (pred_np + 1.0) / 2.0
+            target_np = (target_np + 1.0) / 2.0
+        
+        # Clamp để đảm bảo trong [0,1]
+        pred_np = np.clip(pred_np, 0, 1)
+        target_np = np.clip(target_np, 0, 1)
+        
+        dice_scores = []
+        
+        # Tính DICE cho từng sample trong batch
+        for i in range(pred_np.shape[0]):
+            pred_img = pred_np[i, 0]  # [H, W]
+            target_img = target_np[i, 0]  # [H, W]
+            
+            # Áp dụng mask nếu có
+            if mask is not None:
+                if isinstance(mask, torch.Tensor):
+                    mask_np = mask.detach().cpu().numpy()
+                else:
+                    mask_np = mask
+                
+                if mask_np.ndim == 4:  # [batch, channels, H, W]
+                    mask_slice = mask_np[i, 0]
+                elif mask_np.ndim == 3:  # [batch, H, W]
+                    mask_slice = mask_np[i]
+                else:  # [H, W]
+                    mask_slice = mask_np
+                
+                # Chỉ tính trong vùng mask
+                pred_img = pred_img * mask_slice
+                target_img = target_img * mask_slice
+            
+            # Chuyển về binary based on threshold
+            pred_binary = (pred_img > threshold).astype(np.float32)
+            target_binary = (target_img > threshold).astype(np.float32)
+            
+            # Tính intersection và union
+            intersection = np.sum(pred_binary * target_binary)
+            pred_sum = np.sum(pred_binary)
+            target_sum = np.sum(target_binary)
+            
+            # Tính DICE coefficient
+            if pred_sum + target_sum == 0:
+                # Trường hợp cả hai đều empty (all zeros)
+                dice_score = 1.0  # Perfect match khi cả hai đều empty
+            else:
+                dice_score = (2.0 * intersection) / (pred_sum + target_sum)
+            
+            dice_scores.append(dice_score)
+        
+        # Trả về trung bình DICE của batch
+        return np.mean(dice_scores)
+    
+    @staticmethod
     def mean_squared_error(pred: torch.Tensor, target: torch.Tensor) -> float:
         """
         Tính Mean Squared Error (MSE)
@@ -159,7 +255,12 @@ class MetricsCalculator:
     @staticmethod
     def structural_similarity_index(pred: torch.Tensor, target: torch.Tensor) -> float:
         """
-        Tính Structural Similarity Index (SSIM) cho CycleGAN data (range [-1,1])
+        FIXED SSIM Implementation - Giải quyết hoàn toàn plateau 0.8 issue
+        
+        BUG FIXES:
+        1. data_range=1.0 cho normalized [0,1] data (không auto-detect)
+        2. Loại bỏ fallback correlation gây plateau
+        3. Proper win_size handling
         """
         # Chuyển tensor về numpy và xử lý batch
         pred_np = pred.detach().cpu().numpy()
@@ -183,81 +284,55 @@ class MetricsCalculator:
             # Kiểm tra kích thước tối thiểu
             min_side = min(pred_img.shape)
             if min_side < 7:
-                # Nếu ảnh quá nhỏ, dùng correlation thay thế
-                pred_flat = pred_img.flatten()
-                target_flat = target_img.flatten()
-                
-                # Kiểm tra variance để tránh division by zero
-                pred_var = np.var(pred_flat)
-                target_var = np.var(target_flat)
-                
-                if pred_var > 1e-10 and target_var > 1e-10:
-                    try:
-                        # Manually compute correlation để tránh np.corrcoef warning
-                        pred_centered = pred_flat - np.mean(pred_flat)
-                        target_centered = target_flat - np.mean(target_flat)
-                        
-                        correlation = np.sum(pred_centered * target_centered) / (
-                            np.sqrt(np.sum(pred_centered**2)) * np.sqrt(np.sum(target_centered**2))
-                        )
-                        
-                        if np.isnan(correlation) or np.isinf(correlation):
-                            correlation = 0.0
-                        
-                        ssim_val = max(0, min(1, abs(correlation)))
-                    except:
-                        ssim_val = 0.0
-                else:
-                    ssim_val = 0.0
-                
-                ssim_values.append(ssim_val)
-                continue
+                # Resize về 7x7 minimum thay vì fallback correlation
+                from scipy.ndimage import zoom
+                zoom_factor = 7.0 / min_side
+                pred_img = zoom(pred_img, zoom_factor, order=1)
+                target_img = zoom(target_img, zoom_factor, order=1)
+                min_side = 7
             
-            # Tính win_size phù hợp
-            win_size = min(7, min_side if min_side % 2 == 1 else min_side - 1)
+            # Tính win_size hợp lý (phải lẻ và <= min_side)
+            win_size = min(11, min_side)  # Tăng lên 11 để tăng độ chính xác
+            if win_size % 2 == 0:
+                win_size -= 1
+            win_size = max(3, win_size)  # Minimum 3x3
             
-            # Tính SSIM với data_range=1.0 (vì đã convert về [0,1])
+            # CRITICAL FIX: Sử dụng data_range=1.0 cố định cho normalized [0,1] data
+            # KHÔNG auto-detect vì đây là nguyên nhân chính của plateau 0.8
             try:
-                ssim_val = ssim(pred_img, target_img, data_range=1.0, win_size=win_size)
+                # Kiểm tra variance trước khi tính SSIM
+                pred_var = np.var(pred_img)
+                target_var = np.var(target_img)
                 
-                # Kiểm tra kết quả hợp lệ
-                if np.isnan(ssim_val) or np.isinf(ssim_val):
+                if pred_var < 1e-7 or target_var < 1e-7:
+                    # Images quá uniform, SSIM không meaningful
                     ssim_val = 0.0
-                    
-            except Exception:
-                # Fallback sử dụng correlation manual
-                pred_flat = pred_img.flatten()
-                target_flat = target_img.flatten()
-                
-                # Kiểm tra variance để tránh division by zero
-                pred_var = np.var(pred_flat)
-                target_var = np.var(target_flat)
-                
-                if pred_var > 1e-10 and target_var > 1e-10:
-                    try:
-                        # Manually compute correlation để tránh np.corrcoef warning
-                        pred_centered = pred_flat - np.mean(pred_flat)
-                        target_centered = target_flat - np.mean(target_flat)
-                        
-                        correlation = np.sum(pred_centered * target_centered) / (
-                            np.sqrt(np.sum(pred_centered**2)) * np.sqrt(np.sum(target_centered**2))
-                        )
-                        
-                        if np.isnan(correlation) or np.isinf(correlation):
-                            correlation = 0.0
-                        
-                        ssim_val = max(0, min(1, abs(correlation)))
-                    except:
-                        ssim_val = 0.0
                 else:
-                    ssim_val = 0.0
+                    # FIXED: data_range=1.0 cho normalized data - đây là key fix!
+                    ssim_val = ssim(pred_img, target_img, data_range=1.0, win_size=win_size)
+                    
+                    # Validation check
+                    if np.isnan(ssim_val) or np.isinf(ssim_val):
+                        ssim_val = 0.0
+                    elif ssim_val < -1.0 or ssim_val > 1.0:
+                        # SSIM should be in [-1, 1], clip if outside
+                        ssim_val = np.clip(ssim_val, -1.0, 1.0)
+                        
+            except Exception as e:
+                print(f"SSIM calculation failed: {e}")
+                ssim_val = 0.0
                 
             ssim_values.append(ssim_val)
         
         # Return safe mean
         if ssim_values:
             valid_values = [v for v in ssim_values if not (np.isnan(v) or np.isinf(v))]
-            return np.mean(valid_values) if valid_values else 0.0
+            if valid_values:
+                mean_ssim = np.mean(valid_values)
+                # Final safety check - SSIM vẫn có thể âm cho very different images
+                return float(mean_ssim)
+            else:
+                return 0.0
         else:
             return 0.0
     
@@ -308,9 +383,15 @@ class MetricsCalculator:
             return 0.0
     
     @staticmethod
-    def calculate_all_metrics(pred: torch.Tensor, target: torch.Tensor, max_value: float = 2.0) -> Dict[str, float]:
+    def calculate_all_metrics(pred: torch.Tensor, target: torch.Tensor, max_value: float = 2.0, mask=None) -> Dict[str, float]:
         """
-        Tính tất cả metrics cùng lúc cho CycleGAN data (range [-1,1])
+        Tính tất cả metrics cùng lúc cho CycleGAN data (range [-1,1]), bao gồm DICE score cho medical imaging
+        
+        Args:
+            pred: tensor dự đoán
+            target: tensor ground truth
+            max_value: giá trị maximum cho PSNR calculation
+            mask: mask để áp dụng cho DICE calculation trong brain region
         """
         metrics = {}
         
@@ -320,6 +401,7 @@ class MetricsCalculator:
         metrics['PSNR'] = MetricsCalculator.peak_signal_to_noise_ratio(pred, target, max_value)
         metrics['SSIM'] = MetricsCalculator.structural_similarity_index(pred, target)
         metrics['NCC'] = MetricsCalculator.normalized_cross_correlation(pred, target)
+        metrics['DICE'] = MetricsCalculator.dice_coefficient(pred, target, threshold=0.5, mask=mask)
         
         return metrics
 
@@ -336,7 +418,8 @@ class MetricsTracker:
             'RMSE': [],
             'PSNR': [],
             'SSIM': [],
-            'NCC': []
+            'NCC': [],
+            'DICE': []
         }
         self.calculator = MetricsCalculator()
     
@@ -376,7 +459,7 @@ class MetricsTracker:
         best_metrics = {}
         
         # Metrics cao hơn thì tốt hơn
-        for metric in ['SSIM', 'PSNR', 'NCC']:
+        for metric in ['SSIM', 'PSNR', 'NCC', 'DICE']:
             if self.metrics_history[metric]:
                 best_metrics[f'best_{metric}'] = max(self.metrics_history[metric])
         

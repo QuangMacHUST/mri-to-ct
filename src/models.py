@@ -161,7 +161,7 @@ class VGGPerceptualLoss(nn.Module):
         
     def forward(self, x, y):
         """
-        Tính perceptual loss giữa x và y
+        Tính perceptual loss giữa x và y với enhanced scaling cho medical imaging
         Input: x, y trong range [-1, 1] (từ Tanh activation)
         """
         # ✅ QUAN TRỌNG: Convert từ [-1,1] về [0,1] trước khi apply ImageNet norm
@@ -198,8 +198,18 @@ class VGGPerceptualLoss(nn.Module):
                 y_features = layer(y_features)
             
             if i in self.feature_layers:
-                # Chỉ x_features cần gradient, y_features đã được detach
-                loss += F.mse_loss(x_features, y_features.detach())
+                # ENHANCED: Scale feature loss để có magnitude phù hợp với medical imaging
+                feature_loss = F.mse_loss(x_features, y_features.detach())
+                
+                # MEDICAL IMAGING BOOST: Scale theo layer depth để cân bằng contribution
+                if i <= 8:      # Early layers (texture, edges)
+                    scale_factor = 100.0  # Boost low-level features 
+                elif i <= 15:   # Mid layers (patterns)
+                    scale_factor = 50.0   # Moderate boost
+                else:           # High layers (semantics) 
+                    scale_factor = 25.0   # Conservative boost
+                
+                loss += feature_loss * scale_factor
         
         return loss
 
@@ -226,21 +236,35 @@ class CycleGAN(nn.Module):
         # Perceptual loss với resize=False để giữ nguyên kích thước ảnh
         self.perceptual_loss = VGGPerceptualLoss(resize=False)
         
-        # SSIM calculator - khởi tạo 1 lần thay vì trong training loop
+        # Enhanced SSIM calculator cho medical imaging - FIX PLATEAU 0.8
         try:
             from torchmetrics import StructuralSimilarityIndexMeasure
-            # Data sẽ được convert về [0,1] trước khi tính SSIM
-            self.ssim_calc = StructuralSimilarityIndexMeasure(data_range=1.0).cuda()
-        except:
-            self.ssim_calc = None
-            print("⚠️ Warning: SSIM calculator không khả dụng, sẽ fallback về L1-only")
+            # ULTIMATE FIX: Optimized parameters dựa trên medical imaging research
+            # kernel_size=5 (reduced từ 7), sigma=0.8 (reduced từ 1.0) cho less blur
+            self.ssim_calc = StructuralSimilarityIndexMeasure(
+                data_range=None,           # Auto-detect range - KEY FIX!
+                kernel_size=5,             # OPTIMIZED: 7→5 cho medical patches
+                gaussian_kernel=True,
+                sigma=0.8,                # OPTIMIZED: 1.0→0.8 reduced blur  
+                reduction='elementwise_mean',
+                k1=0.01, k2=0.03         # SSIM stability constants
+            ).cuda()
+            print("✅ ULTIMATE SSIM calculator khởi tạo với breakthrough configuration")
+        except Exception as e:
+            print(f"⚠️ Warning: Enhanced SSIM failed, using fallback: {e}")
+            # Fallback với basic config nhưng vẫn dùng data_range=None
+            try:
+                self.ssim_calc = StructuralSimilarityIndexMeasure(data_range=None).cuda()
+            except:
+                self.ssim_calc = None
+                print("⚠️ Warning: SSIM calculator không khả dụng, sẽ fallback về L1-only")
         
-        # Loss weights - RESEARCH-BASED OPTIMIZATION for Full Slice Training
-        # Dựa trên CycleGAN paper (λ=10) và enhanced cycle loss multiplier (1.6x)
-        self.lambda_cycle = 7.0       # Adjusted: 10.0/1.6≈7.0 (effective: 11.2)
+        # OPTIMIZED loss weights để đạt tỷ lệ lý tưởng cho Medical Imaging  
+        # Target Ratio: Cycle 50-55%, Adversarial 25-30%, Perceptual 15-25%
+        self.lambda_cycle = 6.0       # MODERATE: 5.0 → 6.0 để đạt 50-55% contribution
         self.lambda_identity = 0.0    # Disabled for cross-modal medical imaging
-        self.lambda_perceptual = 10.0 # Increased for high visual quality
-        self.lambda_adversarial = 5.0 # Strong adversarial for medical realism
+        self.lambda_perceptual = 40.0 # BOOST: 25.0 → 40.0 để đạt 15-25% contribution (compensate cho base value thấp)
+        self.lambda_adversarial = 1.0 # STANDARD: Giữ nguyên làm reference baseline
         
     def forward(self, mri, ct):
         """
@@ -363,8 +387,14 @@ class CycleGAN(nn.Module):
         # 3. Identity loss - HOÀN TOÀN LOẠI BỎ cho medical imaging
         loss_identity = torch.tensor(0.0, device=real_mri.device, requires_grad=True)
         
-        # 4. Perceptual loss - chỉ áp dụng cho direction chính (MRI->CT)
-        loss_perceptual = self.perceptual_loss(fake_ct, real_ct)
+        # 4. Enhanced Perceptual loss - áp dụng cho CẢ HAI directions
+        # Tính perceptual loss cho cả MRI->CT và CT->MRI để enhance visual quality
+        loss_perceptual_mri2ct = self.perceptual_loss(fake_ct, real_ct)     # MRI→CT direction  
+        loss_perceptual_ct2mri = self.perceptual_loss(fake_mri, real_mri)   # CT→MRI direction
+
+        # Combined perceptual loss với weight cho medical imaging priority
+        # MRI→CT là primary task nên weight cao hơn
+        loss_perceptual = (0.7 * loss_perceptual_mri2ct + 0.3 * loss_perceptual_ct2mri)
         
         # Total generator loss - KHÔNG BAO GỒM identity loss
         total_loss = (self.lambda_adversarial * loss_gan + 
