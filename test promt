@@ -1,0 +1,3 @@
+python src/test.py --model_path src/checkpoints/best_model_new.pth --test_mode volumes --mri_dir data/Test/MRI --ct_dir data/Test/CT --output_dir test_results_volumes_metrics --device cuda
+
+python src/test.py --model_path src/checkpoints/best_model_new.pth --test_mode dataset --mri_dir data/Test/MRI --ct_dir data/Test/CT --output_dir test_results_best_model_new --device cuda	
